@@ -53,8 +53,28 @@ def find_python_dynlib() -> Path:
     raise FileNotFoundError(f"Could not locate Python {ver} shared library")
 
 
-async def zig_build_lib(module_path: Path, *, link_python: bool = False) -> None:
-    command = [sys.executable, "-m", "ziglang", "build-lib", str(module_path)]
+async def zig_build_lib(
+    module_path: Path,
+    *,
+    link_python: bool = False,
+    output_path: Path | None = None,
+) -> Path:
+    if output_path is None:
+        if sys.platform == "win32":
+            suffix = ".dll"
+        elif sys.platform == "darwin":
+            suffix = ".dylib"
+        else:
+            suffix = ".so"
+        output_path = Path.cwd() / (module_path.stem + suffix)
+    command = [
+        sys.executable,
+        "-m",
+        "ziglang",
+        "build-lib",
+        str(module_path),
+        f"-femit-bin={output_path}",
+    ]
     if link_python:
         python_lib = find_python_dynlib()
         if sys.platform == "win32":
@@ -68,3 +88,4 @@ async def zig_build_lib(module_path: Path, *, link_python: bool = False) -> None
     exit_code = await proc.wait()
     if exit_code != 0:
         raise ZigCompilationError(str(exit_code))
+    return output_path
