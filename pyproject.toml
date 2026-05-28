@@ -5,3 +5,9 @@ description = "A Zig zust-in-time compiler for Python"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["ziglang"]
+
+[project.optional-dependencies]
+cli = ["click"]
+
+[project.scripts]
+zit = "zitcompiler.cli:zit"
