@@ -31,6 +31,7 @@ class BuildLibOptions:
     link_python: bool = False
     output_path: Path | None = None
     module_def: ZigModuleDef | None = None
+    incremental: bool | None = None
 
 
 class ZigCompilationError(OSError): ...
@@ -130,6 +131,16 @@ async def zig_build_lib(opts: BuildLibOptions) -> Path:
         else:
             command += [str(opts.module_path)]
         command += [f"-femit-bin={output_path}"]
+        if opts.incremental is True:
+            if sys.platform not in ("win32", "darwin"):
+                _logger.warning(
+                    "Incremental compilation (-fincremental) is not yet supported by the Zig elf2 "
+                    "linker for shared library targets on ELF platforms. Compilation will likely "
+                    "fail. See https://github.com/ziglang/zig/issues/21165"
+                )
+            command += ["-fincremental"]
+        elif opts.incremental is False:
+            command += ["-fno-incremental"]
         if opts.link_python:
             python_lib = find_python_dynlib()
             lib_name = (
