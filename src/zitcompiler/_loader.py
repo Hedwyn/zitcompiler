@@ -52,6 +52,18 @@ def load_function(
     doc: bytes = b"",
     flags: int = METH_VARARGS,
 ) -> Callable[..., object]:
+    """Load a C function from a native extension and wrap it as a Python callable.
+
+    Args:
+        path: Path to the compiled shared library.
+        symbol: Name of the exported C function.
+        name: Optional Python name for the function; defaults to symbol.
+        doc: Optional docstring for the function.
+        flags: Method flags (METH_VARARGS or METH_NOARGS).
+
+    Returns:
+        A Python callable wrapping the C function.
+    """
     resolved = path.resolve()
     if resolved not in _lib_cache:
         _lib_cache[resolved] = ctypes.CDLL(str(resolved))
@@ -73,8 +85,14 @@ def load_function(
 
 
 def load_class(path: Path, symbol: str) -> type[object]:
-    """
-    Loads a class from a native extension.
+    """Load a Python type object from a native extension.
+
+    Args:
+        path: Path to the compiled shared library.
+        symbol: Name of the exported PyTypeObject.
+
+    Returns:
+        The loaded type object as a Python class.
     """
     resolved = path.resolve()
     if resolved not in _lib_cache:

@@ -1,4 +1,5 @@
 const std = @import("std");
+const params = @import("params");
 
 const Py_ssize_t = isize;
 
@@ -117,7 +118,7 @@ extern var _Py_NoneStruct: PyObject;
 fn greeter_hello_world(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     _ = self;
     _ = args;
-    std.debug.print("Hello from zig!\n", .{});
+    std.debug.print("{s}\n", .{params.hello});
     Py_IncRef(&_Py_NoneStruct);
     return &_Py_NoneStruct;
 }

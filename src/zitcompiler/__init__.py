@@ -17,7 +17,10 @@ from ._loader import load_class, load_function
 from ._types import (
     Annotation,
     UnsupportedType,
+    ZigModuleDef,
     ZigType,
+    generate_zig_code,
+    generate_zig_module_code,
     get_annotation,
     get_annotations,
     get_zig_type,
@@ -25,7 +28,7 @@ from ._types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 type ObjType = Literal["func", "class"]
 
@@ -36,7 +39,7 @@ def zit_compiled(
     symbol_name: str,
     obj_type: Literal["func"],
     *,
-    comptime_params: dict[str, str] | None = None,
+    module_def: ZigModuleDef | None = None,
 ) -> Callable[..., object]: ...
 
 
@@ -45,7 +48,7 @@ def zit_compiled(
     module_path: Path,
     symbol_name: str,
     *,
-    comptime_params: dict[str, str] | None = None,
+    module_def: ZigModuleDef | None = None,
 ) -> Callable[..., object]: ...
 
 
@@ -55,30 +58,59 @@ def zit_compiled(
     symbol_name: str,
     obj_type: Literal["class"],
     *,
-    comptime_params: dict[str, str] | None = None,
+    module_def: ZigModuleDef | None = None,
 ) -> type: ...
+
+
+@overload
+def zit_compiled(
+    module_path: Path,
+    symbol_name: Sequence[str],
+    obj_type: Literal["func"],
+    *,
+    module_def: ZigModuleDef | None = None,
+) -> tuple[Callable[..., object], ...]: ...
+
+
+@overload
+def zit_compiled(
+    module_path: Path,
+    symbol_name: Sequence[str],
+    *,
+    module_def: ZigModuleDef | None = None,
+) -> tuple[Callable[..., object], ...]: ...
+
+
+@overload
+def zit_compiled(
+    module_path: Path,
+    symbol_name: Sequence[str],
+    obj_type: Literal["class"],
+    *,
+    module_def: ZigModuleDef | None = None,
+) -> tuple[type, ...]: ...
 
 
 def zit_compiled(
     module_path: Path,
-    symbol_name: str,
+    symbol_name: str | Sequence[str],
     obj_type: ObjType = "func",
     *,
-    comptime_params: dict[str, str] | None = None,
+    module_def: ZigModuleDef | None = None,
 ) -> object:
-    """Compile and load a Zig module, exposing a function or class to Python.
+    """Compile and load a Zig module, exposing one or more functions or classes to Python.
 
-    Compiles the Zig module at module_path and loads the specified symbol.
-    Optionally passes compile-time parameters to the Zig compiler.
+    Compiles the Zig module at module_path and loads the specified symbol(s).
+    When multiple symbol names are provided, all are loaded from a single compilation.
 
     Args:
         module_path: Path to the Zig source file.
-        symbol_name: Name of the function or class to load from the compiled module.
+        symbol_name: Name or sequence of names of symbols to load from the compiled module.
         obj_type: Either "func" or "class"; determines how the symbol is loaded.
-        comptime_params: Compile-time parameters to pass to the Zig compiler.
+        module_def: Optional ZigModuleDef with module-level constants and struct definitions.
 
     Returns:
-        The loaded function or class.
+        The loaded function or class, or a tuple of them when multiple names are given.
     """
     with tempfile.TemporaryDirectory() as tmp:
         dynlib_name = module_path.name.replace(".zig", ".so")
@@ -86,23 +118,30 @@ def zit_compiled(
             module_path=module_path,
             link_python=True,
             output_path=Path(tmp) / dynlib_name,
-            comptime_params=comptime_params,
+            module_def=module_def,
         )
         dynlib_path = asyncio.run(zig_build_lib(opts))
+
+        names = [symbol_name] if isinstance(symbol_name, str) else list(symbol_name)
         match obj_type:
             case "class":
-                return load_class(dynlib_path, symbol_name)
+                loaded = tuple(load_class(dynlib_path, n) for n in names)
             case "func":
-                return load_function(dynlib_path, symbol_name)
+                loaded = tuple(load_function(dynlib_path, n) for n in names)
             case _ as unreachable:
                 assert_never(unreachable)
+
+        return loaded[0] if isinstance(symbol_name, str) else loaded
 
 
 __all__ = [
     "Annotation",
     "BuildLibOptions",
     "UnsupportedType",
+    "ZigModuleDef",
     "ZigType",
+    "generate_zig_code",
+    "generate_zig_module_code",
     "get_annotation",
     "get_annotations",
     "get_zig_type",

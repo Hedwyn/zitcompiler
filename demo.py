@@ -2,17 +2,45 @@
 Tiny demo for this project.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 
-from zitcompiler import zit_compiled
-from zitcompiler._compiler import zig_build_lib
+from zitcompiler import ZigModuleDef, zit_compiled
 
 examples_folder = Path("examples")
 
 say_hello = zit_compiled(examples_folder / "hello_world_ext_no_mod.zig", "hello_world")
 say_hello()
 
-GreeterType = zit_compiled(examples_folder / "greeter_ext.zig", "GreeterType", "class")
 
-greeter = GreeterType()
-greeter.hello_world()
+@dataclass
+class TopLevel:
+    _placeholder: int = 0
+
+
+@dataclass
+class Person:
+    age: int
+    height: int
+    weight: int
+
+
+person_instance = Person(age=30, height=180, weight=75)
+person_module = ZigModuleDef(
+    top_level=TopLevel,
+    structs=[Person],
+    module_name="person",
+)
+
+print("\n=== Person Module Demo ===", flush=True)
+print_person_fields, format_person_values = zit_compiled(
+    examples_folder / "person_printer.zig",
+    ["print_person_fields", "format_person_values"],
+    module_def=person_module,
+)
+
+print("\nStruct field information from Zig (via compile-time reflection):", flush=True)
+print_person_fields()
+
+print("\nFormatted person instance values:", flush=True)
+format_person_values(person_instance.age, person_instance.height, person_instance.weight)
