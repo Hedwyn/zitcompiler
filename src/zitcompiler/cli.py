@@ -13,7 +13,7 @@ from pathlib import Path
 
 import click
 
-from ._compiler import zig_build_lib
+from ._compiler import BuildLibOptions, zig_build_lib
 
 
 @click.group()
@@ -24,5 +24,5 @@ def zit() -> None:
 @zit.command
 @click.argument("module_path", type=Path)
 def build_lib(*, module_path: Path) -> None:
-    asyncio.run(zig_build_lib(module_path))
+    asyncio.run(zig_build_lib(BuildLibOptions(module_path=module_path)))
     click.echo("Library built !")

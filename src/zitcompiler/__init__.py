@@ -28,7 +28,7 @@ from ._types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
 
 type ObjType = Literal["func", "class"]
 
@@ -65,7 +65,7 @@ def zit_compiled(
 @overload
 def zit_compiled(
     module_path: Path,
-    symbol_name: Sequence[str],
+    symbol_name: list[str],
     obj_type: Literal["func"],
     *,
     module_def: ZigModuleDef | None = None,
@@ -75,7 +75,7 @@ def zit_compiled(
 @overload
 def zit_compiled(
     module_path: Path,
-    symbol_name: Sequence[str],
+    symbol_name: list[str],
     *,
     module_def: ZigModuleDef | None = None,
 ) -> tuple[Callable[..., object], ...]: ...
@@ -84,7 +84,7 @@ def zit_compiled(
 @overload
 def zit_compiled(
     module_path: Path,
-    symbol_name: Sequence[str],
+    symbol_name: list[str],
     obj_type: Literal["class"],
     *,
     module_def: ZigModuleDef | None = None,
@@ -93,7 +93,7 @@ def zit_compiled(
 
 def zit_compiled(
     module_path: Path,
-    symbol_name: str | Sequence[str],
+    symbol_name: str | list[str],
     obj_type: ObjType = "func",
     *,
     module_def: ZigModuleDef | None = None,
@@ -123,6 +123,7 @@ def zit_compiled(
         dynlib_path = asyncio.run(zig_build_lib(opts))
 
         names = [symbol_name] if isinstance(symbol_name, str) else list(symbol_name)
+        loaded: tuple[type[object], ...] | tuple[Callable[..., object], ...]
         match obj_type:
             case "class":
                 loaded = tuple(load_class(dynlib_path, n) for n in names)

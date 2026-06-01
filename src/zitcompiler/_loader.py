@@ -77,7 +77,7 @@ def load_function(
         ml_flags=flags,
         ml_doc=doc,
     )
-    py_func = _PyCFunction_NewEx(ctypes.byref(method_def), None, None)
+    py_func: object = _PyCFunction_NewEx(ctypes.byref(method_def), None, None)
     _method_def_registry[id(py_func)] = method_def
     if not callable(py_func):
         raise TypeError(f"Loaded symbol is not a Python function: {py_func}")
@@ -102,7 +102,5 @@ def load_class(path: Path, symbol: str) -> type[object]:
     if _PyType_Ready(addr) < 0:
         raise RuntimeError(f"PyType_Ready failed for '{symbol}'")
     result = ctypes.cast(addr, ctypes.py_object).value
-    assert isinstance(result, type), (
-        f"'{symbol}' is not a type object, got {type(result)}"
-    )
+    assert isinstance(result, type), f"'{symbol}' is not a type object, got {type(result)}"
     return result

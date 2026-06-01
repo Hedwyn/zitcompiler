@@ -61,7 +61,7 @@ def find_python_dynlib() -> Path:
                 f"libpython{ver}.so",
                 f"libpython{ver}.dylib",  # macOS non-framework fallback
             ]
-            if n is not None
+            if isinstance(n, str)
         ]
         lib_dirs = [
             d
@@ -69,7 +69,7 @@ def find_python_dynlib() -> Path:
                 sysconfig.get_config_var("LIBDIR"),
                 sysconfig.get_config_var("LIBPL"),
             ]
-            if d is not None
+            if isinstance(d, str)
         ]
         for d in lib_dirs:
             for name in lib_names:
@@ -121,7 +121,12 @@ async def zig_build_lib(opts: BuildLibOptions) -> Path:
         command = [sys.executable, "-m", "ziglang", "build-lib"]
         if module_info is not None:
             module_file, module_name = module_info
-            command += ["--dep", module_name, f"-Mmain={opts.module_path}", f"-M{module_name}={module_file}"]
+            command += [
+                "--dep",
+                module_name,
+                f"-Mmain={opts.module_path}",
+                f"-M{module_name}={module_file}",
+            ]
         else:
             command += [str(opts.module_path)]
         command += [f"-femit-bin={output_path}"]
