@@ -5,8 +5,9 @@ Verifies that they match dataclasses behavior.
 
 from __future__ import annotations
 
-import pytest
 from dataclasses import dataclass, fields
+
+import pytest
 
 from zitcompiler.zetaclasses import zetaclass
 
@@ -43,6 +44,7 @@ def test_eq() -> None:
 
 # ── init=False ────────────────────────────────────────────────────────────────
 
+
 class _Counter:
     count: int = 0
 
@@ -69,6 +71,7 @@ def test_no_init_rejects_positional_args() -> None:
 
 
 # ── eq=False ──────────────────────────────────────────────────────────────────
+
 
 class _Point:
     x: int = 0

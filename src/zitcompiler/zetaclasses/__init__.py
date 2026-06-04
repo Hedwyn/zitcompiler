@@ -9,6 +9,7 @@ Populates the dataclass-like methods with native code.
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, Unpack, get_type_hints
@@ -121,6 +122,15 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     with tempfile.TemporaryDirectory() as tmp:
         params_path = Path(tmp) / "params.zig"
         params_path.write_text(params_src)
+        if (dump_path := os.environ.get("ZETACLASS_DUMP_PATH")) is not None:
+            try:
+                Path(dump_path).write_text(params_src)
+            except OSError as exc:
+                raise OSError(
+                    f"Failed to dump params source code to {dump_path}"
+                    "This happens beucase ZETACLASS_DUMP_PATH is set"
+                ) from exc
+
         out_path = Path(tmp) / f"{class_name}.so"
 
         build_opts = BuildLibOptions(
