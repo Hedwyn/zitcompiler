@@ -86,6 +86,83 @@ greet()
 
 `load_class` works the same way for exported `PyTypeObject` symbols.
 
+## Zetaclasses
+
+`zetaclass` is a drop-in replacement for `@dataclass` that compiles the class to a native Zig struct at decoration time. The resulting type behaves like a regular Python class but `__init__` and `__eq__` run as compiled C slots — no Python interpreter overhead.
+
+### Usage
+
+```python
+from zitcompiler.zetaclasses import zetaclass
+
+@zetaclass
+class Point:
+    x: int
+    y: int
+
+p1 = Point(1, 2)
+p2 = Point(x=1, y=2)
+assert p1 == p2
+```
+
+Supported field types: `int` (`i64`), `float` (`f64`), `str` (Python string object).
+
+Default values work the same as with `@dataclass`:
+
+```python
+@zetaclass
+class Config:
+    host: str = "localhost"
+    port: int = 8080
+    timeout: float = 30.0
+
+cfg = Config()            # all defaults
+cfg2 = Config(port=9090)  # keyword override
+assert cfg != cfg2
+```
+
+Positional, keyword, and mixed argument styles are all supported:
+
+```python
+Config("example.com", 443)       # positional
+Config(host="example.com")       # keyword only
+Config("example.com", timeout=5) # mixed
+```
+
+Attribute access works normally — fields are readable and writable:
+
+```python
+print(cfg.host)   # "localhost"
+cfg.port = 9090
+```
+
+### Current limitations
+
+- Supported field types: `int`, `float`, `str`. Other types raise `TypeError` at decoration time.
+- `__repr__`, `__hash__`, ordering operators, and `frozen` are not yet implemented.
+- Compilation runs synchronously at decoration time (same as other `zitcompiler` calls).
+
+### Internal implementation
+
+When `@zetaclass` is applied, the decorator:
+
+1. Reads field names, types, and default values from the class annotations (following the MRO).
+2. Generates a `params.zig` source file containing an `extern struct` with `ob_base: PyObject` as its first field — the layout CPython requires for all heap-allocated objects — followed by one field per annotation.
+3. Generates a `Defaults` struct holding comptime constants for each field that has a default value. String defaults are stored as `[:0]const u8` (null-terminated slice); numeric defaults as `i64`/`f64`.
+4. Compiles `params.zig` against `core.zig` (the static Zig library shipped with the package) using `zig build-lib`.
+5. Loads the exported `PyTypeObject` symbol via `load_class`, which calls `PyType_Ready` to finalise the type.
+
+`core.zig` provides the comptime slot generators:
+
+| Slot | Generator | What it does |
+|------|-----------|--------------|
+| `tp_init` | `initFn(T, Defaults)` | Iterates struct fields at comptime; reads positional args, then kwargs, then comptime defaults. Stores values with ref-counting for `?*PyObject` fields. |
+| `tp_richcompare` | `richCompareFn(T)` | Field-by-field equality via `!=` for numeric fields and `PyObject_RichCompareBool` for string fields. Returns `Py_NotImplemented` for non-EQ/NE ops or mismatched types. |
+| `tp_members` | `membersArray(T)` | Comptime-generates a null-terminated `PyMemberDef[]` using `@offsetOf` for each field. Python's built-in member descriptor machinery handles all get/set at runtime — no Zig code runs on attribute access. |
+| `tp_dealloc` | `deallocFn(T)` | Decrefs all `?*PyObject` fields then calls `PyObject_Free`. Only wired in when the struct contains object fields; otherwise null and CPython inherits the default from `object`. |
+
+The `Defaults` struct approach avoids any Python-level wrapper class: defaults are resolved entirely in the compiled `tp_init` slot, so the loaded `PyTypeObject` is the final Python type with no subclassing or runtime indirection.
+
 ## Known limitations
 
 ### Incremental compilation on Linux (ELF targets)

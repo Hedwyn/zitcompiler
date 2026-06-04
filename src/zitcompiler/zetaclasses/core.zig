@@ -194,7 +194,7 @@ fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void 
 
 /// Returns a namespace with a static `array: [N+1]PyMemberDef` for struct T.
 /// The array is null-sentinel terminated and can be passed directly to tp_members.
-pub fn MembersArray(comptime T: type) type {
+pub fn membersArray(comptime T: type) type {
     comptime assertObBase(T);
     const data_fields = @typeInfo(T).@"struct".fields[1..];
     const N = data_fields.len;
@@ -221,7 +221,7 @@ pub fn MembersArray(comptime T: type) type {
 /// Fields are populated in declaration order from positional args, then keyword
 /// args by field name, then comptime defaults from Defaults (if declared).
 /// Use core.NoDefaults when no defaults are needed.
-pub fn InitFn(comptime T: type, comptime Defaults: type) type {
+pub fn initFn(comptime T: type, comptime Defaults: type) type {
     comptime assertObBase(T);
     return struct {
         pub fn call(
@@ -270,7 +270,7 @@ pub fn InitFn(comptime T: type, comptime Defaults: type) type {
 ///
 /// Handles Py_EQ and Py_NE via field-by-field comparison.
 /// Returns Py_NotImplemented for other ops or when operand types differ.
-pub fn RichCompareFn(comptime T: type) type {
+pub fn richCompareFn(comptime T: type) type {
     comptime assertObBase(T);
     return struct {
         pub fn call(
@@ -326,7 +326,7 @@ pub fn RichCompareFn(comptime T: type) type {
 /// Decrefs all ?*PyObject fields, then frees the object memory.
 /// Only used for types that have object fields; otherwise tp_dealloc is left null
 /// and PyType_Ready inherits the default from object.
-pub fn DeallocFn(comptime T: type) type {
+pub fn deallocFn(comptime T: type) type {
     return struct {
         pub fn call(self_obj: ?*PyObject) callconv(.c) void {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
@@ -358,7 +358,7 @@ pub fn makeTypeObject(
         .tp_basicsize = @sizeOf(T),
         .tp_itemsize = 0,
         .tp_dealloc = if (hasObjectFields(T))
-            @ptrCast(@constCast(&DeallocFn(T).call))
+            @ptrCast(@constCast(&deallocFn(T).call))
         else
             null,
         .tp_vectorcall_offset = 0,
@@ -379,19 +379,19 @@ pub fn makeTypeObject(
         .tp_doc = null,
         .tp_traverse = null,
         .tp_clear = null,
-        .tp_richcompare = @ptrCast(@constCast(&RichCompareFn(T).call)),
+        .tp_richcompare = @ptrCast(@constCast(&richCompareFn(T).call)),
         .tp_weaklistoffset = 0,
         .tp_iter = null,
         .tp_iternext = null,
         .tp_methods = null,
-        .tp_members = &MembersArray(T).array,
+        .tp_members = &membersArray(T).array,
         .tp_getset = null,
         .tp_base = null,
         .tp_dict = null,
         .tp_descr_get = null,
         .tp_descr_set = null,
         .tp_dictoffset = 0,
-        .tp_init = @ptrCast(@constCast(&InitFn(T, Defaults).call)),
+        .tp_init = @ptrCast(@constCast(&initFn(T, Defaults).call)),
         .tp_alloc = null,
         .tp_new = &PyType_GenericNew,
         .tp_free = null,
