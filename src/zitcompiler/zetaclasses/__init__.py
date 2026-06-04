@@ -11,9 +11,12 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
-from typing import TypedDict, Unpack, get_type_hints
+from typing import TYPE_CHECKING, TypedDict, Unpack, get_type_hints
 
 from zitcompiler import BuildLibOptions, load_class, zig_build_lib
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class DataclassKwargs(TypedDict, total=False):
@@ -54,6 +57,9 @@ def _generate_params_zig(
     class_name: str,
     field_pairs: list[tuple[str, type]],
     defaults: dict[str, object],
+    *,
+    init: bool = True,
+    eq: bool = True,
 ) -> str:
     lines = ['const core = @import("core");', ""]
 
@@ -74,28 +80,25 @@ def _generate_params_zig(
     else:
         defaults_arg = "core.NoDefaults"
 
+    zig_init = str(init).lower()
+    zig_eq = str(eq).lower()
     lines.append("")
     lines.append(
         f"pub export var {class_name}Type: core.PyTypeObject = "
-        f'core.makeTypeObject({class_name}Object, {defaults_arg}, "{class_name}");',
+        f'core.makeTypeObject({class_name}Object, {defaults_arg}, "{class_name}", '
+        f".{{ .init = {zig_init}, .eq = {zig_eq} }});",
     )
     return "\n".join(lines)
 
 
-def zetaclass(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
-    """Compile and load a native dataclass-compatible type backed by Zig.
-
-    Inspects annotations from cls and its bases, compiles a Zig struct with
-    native __init__ (including defaults) and __eq__ slots.
-
-    Accepts the same keyword arguments as @dataclass. Any argument other than
-    the defaults raises NotImplementedError until the corresponding feature is
-    implemented.
-    """
+def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
+    init = kwargs.pop("init", True)
+    eq = kwargs.pop("eq", True)
     if kwargs:
         raise NotImplementedError(
-            f"zetaclass: keyword arguments not yet supported: {', '.join(kwargs)}"
+            f"zetaclass: keyword arguments not yet supported: {', '.join(sorted(kwargs))}",
         )
+
     hints = get_type_hints(cls)
     field_names = list(hints.keys())
     field_pairs = [(n, hints[n]) for n in field_names]
@@ -113,18 +116,40 @@ def zetaclass(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
                 break
 
     class_name = cls.__name__
-    params_src = _generate_params_zig(class_name, field_pairs, defaults)
+    params_src = _generate_params_zig(class_name, field_pairs, defaults, init=init, eq=eq)
 
     with tempfile.TemporaryDirectory() as tmp:
         params_path = Path(tmp) / "params.zig"
         params_path.write_text(params_src)
         out_path = Path(tmp) / f"{class_name}.so"
 
-        opts = BuildLibOptions(
+        build_opts = BuildLibOptions(
             module_path=params_path,
             link_python=True,
             output_path=out_path,
             extra_deps={"core": _CORE_ZIG},
         )
-        so_path = asyncio.run(zig_build_lib(opts))
+        so_path = asyncio.run(zig_build_lib(build_opts))
         return load_class(so_path, f"{class_name}Type")
+
+
+def zetaclass(
+    cls: type | None = None, **kwargs: Unpack[DataclassKwargs]
+) -> type | Callable[[type], type]:
+    """Compile and load a native dataclass-compatible type backed by Zig.
+
+    Inspects annotations from cls and its bases, compiles a Zig struct with
+    native __init__ (including defaults) and __eq__ slots.
+
+    Accepts the same keyword arguments as @dataclass. Supported: init, eq.
+    Any other argument raises NotImplementedError.
+
+    Usable as @zetaclass or @zetaclass(init=False, eq=True, ...).
+    """
+    if cls is not None:
+        return _zetaclass_impl(cls, **kwargs)
+
+    def _decorator(cls: type) -> type:
+        return _zetaclass_impl(cls, **kwargs)
+
+    return _decorator

@@ -11,7 +11,7 @@
 //!   };
 //!
 //!   pub export var PointType: core.PyTypeObject =
-//!       core.makeTypeObject(PointObject, core.NoDefaults, "Point");
+//!       core.makeTypeObject(PointObject, core.NoDefaults, "Point", .{});
 //!
 //! For default values, pass a struct with pub const fields matching field names:
 //!
@@ -21,7 +21,7 @@
 //!       pub const height: f64 = 1.77;
 //!   };
 //!   pub export var PersonType: core.PyTypeObject =
-//!       core.makeTypeObject(PersonObject, PersonDefaults, "Person");
+//!       core.makeTypeObject(PersonObject, PersonDefaults, "Person", .{});
 //!
 //! The struct must have `ob_base: core.PyObject` as its first field.
 //! Supported field types: i64, f64, ?*PyObject (for Python str/object fields).
@@ -128,6 +128,7 @@ extern fn PyFloat_AsDouble(obj: ?*PyObject) f64;
 extern fn PyTuple_Size(obj: ?*PyObject) Py_ssize_t;
 extern fn PyTuple_GetItem(obj: ?*PyObject, i: Py_ssize_t) ?*PyObject;
 extern fn PyDict_GetItemString(dict: ?*PyObject, key: [*:0]const u8) ?*PyObject;
+extern fn PyDict_Size(dict: ?*PyObject) Py_ssize_t;
 extern fn PyErr_SetString(exc: ?*PyObject, msg: [*:0]const u8) void;
 extern fn PyErr_Occurred() ?*PyObject;
 extern fn PyObject_RichCompareBool(a: ?*PyObject, b: ?*PyObject, op: c_int) c_int;
@@ -264,6 +265,30 @@ pub fn initFn(comptime T: type, comptime Defaults: type) type {
     };
 }
 
+// ── tp_init (init=False) ──────────────────────────────────────────────────────
+
+/// tp_init slot used when init=False: accepts no arguments, mirrors object.__init__
+/// behavior on a type that has a custom tp_new (PyType_GenericNew doesn't suppress
+/// the check that object_init would otherwise do).
+pub fn noInitFn() type {
+    return struct {
+        pub fn call(
+            self_obj: ?*PyObject,
+            args: ?*PyObject,
+            kwargs: ?*PyObject,
+        ) callconv(.c) c_int {
+            _ = self_obj;
+            const nargs: usize = if (args != null) @intCast(PyTuple_Size(args)) else 0;
+            const has_kwargs = kwargs != null and PyDict_Size(kwargs) > 0;
+            if (nargs > 0 or has_kwargs) {
+                PyErr_SetString(PyExc_TypeError, "zetaclass with init=False takes no arguments");
+                return -1;
+            }
+            return 0;
+        }
+    };
+}
+
 // ── tp_richcompare ────────────────────────────────────────────────────────────
 
 /// Returns a namespace containing `call`, suitable for use as tp_richcompare.
@@ -342,15 +367,27 @@ pub fn deallocFn(comptime T: type) type {
 
 // ── makeTypeObject ────────────────────────────────────────────────────────────
 
+/// Options controlling which slots are wired into the generated type.
+/// Mirror the keyword arguments accepted by Python's @dataclass decorator.
+pub const MakeTypeOptions = struct {
+    /// Wire tp_init; set false when init=False is passed to @zetaclass.
+    init: bool = true,
+    /// Wire tp_richcompare; set false when eq=False is passed to @zetaclass.
+    eq: bool = true,
+};
+
 /// Build a PyTypeObject for extern struct T.
 /// Assign to an `export var` in generated params.zig, then load via load_class().
 ///
 /// Defaults: a struct with pub const fields for each field that has a default.
 /// Use core.NoDefaults when no defaults are needed.
+///
+/// opts: MakeTypeOptions controlling which slots are generated.
 pub fn makeTypeObject(
     comptime T: type,
     comptime Defaults: type,
     comptime name: [:0]const u8,
+    comptime opts: MakeTypeOptions,
 ) PyTypeObject {
     return PyTypeObject{
         .ob_base = .{ .ob_base = .{ .ob_refcnt = 1, .ob_type = null }, .ob_size = 0 },
@@ -379,7 +416,7 @@ pub fn makeTypeObject(
         .tp_doc = null,
         .tp_traverse = null,
         .tp_clear = null,
-        .tp_richcompare = @ptrCast(@constCast(&richCompareFn(T).call)),
+        .tp_richcompare = if (opts.eq) @ptrCast(@constCast(&richCompareFn(T).call)) else null,
         .tp_weaklistoffset = 0,
         .tp_iter = null,
         .tp_iternext = null,
@@ -391,7 +428,10 @@ pub fn makeTypeObject(
         .tp_descr_get = null,
         .tp_descr_set = null,
         .tp_dictoffset = 0,
-        .tp_init = @ptrCast(@constCast(&initFn(T, Defaults).call)),
+        .tp_init = if (opts.init)
+            @ptrCast(@constCast(&initFn(T, Defaults).call))
+        else
+            @ptrCast(@constCast(&noInitFn().call)),
         .tp_alloc = null,
         .tp_new = &PyType_GenericNew,
         .tp_free = null,
