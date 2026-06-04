@@ -32,6 +32,7 @@ class BuildLibOptions:
     output_path: Path | None = None
     module_def: ZigModuleDef | None = None
     incremental: bool | None = None
+    extra_deps: dict[str, Path] | None = None
 
 
 class ZigCompilationError(OSError): ...
@@ -120,14 +121,18 @@ async def zig_build_lib(opts: BuildLibOptions) -> Path:
     )
     with ctx as module_info:
         command = [sys.executable, "-m", "ziglang", "build-lib"]
+        all_deps: list[tuple[str, str]] = []
         if module_info is not None:
             module_file, module_name = module_info
-            command += [
-                "--dep",
-                module_name,
-                f"-Mmain={opts.module_path}",
-                f"-M{module_name}={module_file}",
-            ]
+            all_deps.append((module_name, module_file))
+        if opts.extra_deps:
+            all_deps.extend((name, str(path)) for name, path in opts.extra_deps.items())
+        if all_deps:
+            for dep_name, _ in all_deps:
+                command += ["--dep", dep_name]
+            command += [f"-Mmain={opts.module_path}"]
+            for dep_name, dep_path in all_deps:
+                command += [f"-M{dep_name}={dep_path}"]
         else:
             command += [str(opts.module_path)]
         command += [f"-femit-bin={output_path}"]

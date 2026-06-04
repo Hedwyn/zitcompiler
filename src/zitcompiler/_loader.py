@@ -8,8 +8,11 @@ Utilities to load Python objects exported from compiled native extensions.
 from __future__ import annotations
 
 import ctypes
-from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, ClassVar
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
 
 METH_VARARGS = 0x0001
 METH_NOARGS = 0x0004
