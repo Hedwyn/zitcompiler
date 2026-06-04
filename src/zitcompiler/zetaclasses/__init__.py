@@ -74,10 +74,7 @@ def _generate_params_zig(
     lines.append("};")
     lines.append("")
 
-    lines.append(f"pub const {class_name}Object = extern struct {{")
-    lines.append("    ob_base: core.PyObject,")
-    lines.append(f"    data: {data_type},")
-    lines.append("};")
+    lines.append(f"pub const {class_name}Object = core.wrapAsPythonObject({data_type});")
     lines.append("")
 
     zig_init = str(init).lower()

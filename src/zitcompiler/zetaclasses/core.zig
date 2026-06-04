@@ -147,7 +147,18 @@ const Py_T_DOUBLE: c_int = 4;
 const Py_T_OBJECT_EX: c_int = 16;
 const Py_T_LONGLONG: c_int = 17;
 
-// ── Comptime helpers ──────────────────────────────────────────────────────────
+// ── Public comptime helpers ───────────────────────────────────────────────────
+
+/// Wraps a data struct as a Python object struct by prepending `ob_base: PyObject`.
+/// The returned type is suitable for use as the Object struct in makeTypeObject.
+pub fn wrapAsPythonObject(comptime DataType: type) type {
+    return extern struct {
+        ob_base: PyObject,
+        data: DataType,
+    };
+}
+
+// ── Internal comptime helpers ─────────────────────────────────────────────────
 
 fn assertObBase(comptime T: type) void {
     const flds = @typeInfo(T).@"struct".fields;
