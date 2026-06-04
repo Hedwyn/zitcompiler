@@ -42,14 +42,14 @@ _ZIG_FIELD_TYPES: dict[type, str] = {
 }
 
 
-def _zig_default_line[T](fname: str, ftype: type[T], value: T) -> str:
+def _zig_default_decl[T](fname: str, ftype: type[T], value: T) -> str:
     if ftype is int:
-        return f"    pub const {fname}: i64 = {int(value)};"
+        return f"    pub const {fname}_default: i64 = {int(value)};"
     elif ftype is float:
-        return f"    pub const {fname}: f64 = {float(value)!r};"
+        return f"    pub const {fname}_default: f64 = {float(value)!r};"
     elif ftype is str:
         escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-        return f'    pub const {fname}: [:0]const u8 = "{escaped}";'
+        return f'    pub const {fname}_default: [:0]const u8 = "{escaped}";'
     else:
         raise TypeError(f"unsupported default type {ftype!r}")
 
@@ -64,29 +64,27 @@ def _generate_params_zig(
 ) -> str:
     lines = ['const core = @import("core");', ""]
 
-    lines.append(f"pub const {class_name}Object = extern struct {{")
-    lines.append("    ob_base: core.PyObject,")
+    data_type = f"{class_name}Data"
+    lines.append(f"const {data_type} = extern struct {{")
     for fname, ftype in field_pairs:
         lines.append(f"    {fname}: {_ZIG_FIELD_TYPES[ftype]},")
+    for fname, ftype in field_pairs:
+        if fname in defaults:
+            lines.append(_zig_default_decl(fname, ftype, defaults[fname]))
     lines.append("};")
     lines.append("")
 
-    if defaults:
-        lines.append(f"const {class_name}Defaults = struct {{")
-        for fname, ftype in field_pairs:
-            if fname in defaults:
-                lines.append(_zig_default_line(fname, ftype, defaults[fname]))
-        lines.append("};")
-        defaults_arg = f"{class_name}Defaults"
-    else:
-        defaults_arg = "core.NoDefaults"
+    lines.append(f"pub const {class_name}Object = extern struct {{")
+    lines.append("    ob_base: core.PyObject,")
+    lines.append(f"    data: {data_type},")
+    lines.append("};")
+    lines.append("")
 
     zig_init = str(init).lower()
     zig_eq = str(eq).lower()
-    lines.append("")
     lines.append(
         f"pub export var {class_name}Type: core.PyTypeObject = "
-        f'core.makeTypeObject({class_name}Object, {defaults_arg}, "{class_name}", '
+        f'core.makeTypeObject({class_name}Object, "{class_name}", '
         f".{{ .init = {zig_init}, .eq = {zig_eq} }});",
     )
     return "\n".join(lines)
@@ -128,7 +126,7 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             except OSError as exc:
                 raise OSError(
                     f"Failed to dump params source code to {dump_path}"
-                    "This happens beucase ZETACLASS_DUMP_PATH is set"
+                    "This happens beucase ZETACLASS_DUMP_PATH is set",
                 ) from exc
 
         out_path = Path(tmp) / f"{class_name}.so"
@@ -144,7 +142,8 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
 
 
 def zetaclass(
-    cls: type | None = None, **kwargs: Unpack[DataclassKwargs]
+    cls: type | None = None,
+    **kwargs: Unpack[DataclassKwargs],
 ) -> type | Callable[[type], type]:
     """Compile and load a native dataclass-compatible type backed by Zig.
 

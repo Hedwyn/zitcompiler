@@ -4,27 +4,25 @@
 //!
 //!   const core = @import("core");
 //!
-//!   pub const PointObject = extern struct {
+//!   const PersonData = extern struct {
+//!       name: ?*core.PyObject,
+//!       age: i64,
+//!       height: f64,
+//!       pub const name_default: [:0]const u8 = "John";
+//!       pub const age_default: i64 = 35;
+//!       pub const height_default: f64 = 1.77;
+//!   };
+//!
+//!   pub const PersonObject = extern struct {
 //!       ob_base: core.PyObject,
-//!       x: i64,
-//!       y: i64,
+//!       data: PersonData,
 //!   };
 //!
-//!   pub export var PointType: core.PyTypeObject =
-//!       core.makeTypeObject(PointObject, core.NoDefaults, "Point", .{});
-//!
-//! For default values, pass a struct with pub const fields matching field names:
-//!
-//!   const PersonDefaults = struct {
-//!       pub const name: [:0]const u8 = "John";  // str fields use C-string slice
-//!       pub const age: i64 = 35;
-//!       pub const height: f64 = 1.77;
-//!   };
 //!   pub export var PersonType: core.PyTypeObject =
-//!       core.makeTypeObject(PersonObject, PersonDefaults, "Person", .{});
+//!       core.makeTypeObject(PersonObject, "Person", .{});
 //!
-//! The struct must have `ob_base: core.PyObject` as its first field.
-//! Supported field types: i64, f64, ?*PyObject (for Python str/object fields).
+//! Fields with no default simply omit the `pub const` declaration; missing
+//! arguments at init time will raise TypeError.
 //! @date: 04.06.2026
 //! @author: Baptiste Pestourie
 
@@ -149,15 +147,20 @@ const Py_T_DOUBLE: c_int = 4;
 const Py_T_OBJECT_EX: c_int = 16;
 const Py_T_LONGLONG: c_int = 17;
 
-/// Pass as Defaults when the class has no default field values.
-pub const NoDefaults = struct {};
-
 // ── Comptime helpers ──────────────────────────────────────────────────────────
 
 fn assertObBase(comptime T: type) void {
     const flds = @typeInfo(T).@"struct".fields;
     if (flds.len == 0 or !std.mem.eql(u8, flds[0].name, "ob_base"))
         @compileError(@typeName(T) ++ ": first field must be `ob_base: PyObject`");
+}
+
+/// Returns the type of the `data` field (second field of the Object struct).
+fn getDataType(comptime T: type) type {
+    const flds = @typeInfo(T).@"struct".fields;
+    if (flds.len < 2 or !std.mem.eql(u8, flds[1].name, "data"))
+        @compileError(@typeName(T) ++ ": expected second field `data`");
+    return flds[1].type;
 }
 
 fn memberTypeCode(comptime FieldType: type) c_int {
@@ -170,7 +173,8 @@ fn memberTypeCode(comptime FieldType: type) c_int {
 }
 
 fn hasObjectFields(comptime T: type) bool {
-    inline for (@typeInfo(T).@"struct".fields[1..]) |field| {
+    const DataType = getDataType(T);
+    inline for (@typeInfo(DataType).@"struct".fields) |field| {
         if (field.type == ?*PyObject) return true;
     }
     return false;
@@ -197,14 +201,16 @@ fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void 
 /// The array is null-sentinel terminated and can be passed directly to tp_members.
 pub fn membersArray(comptime T: type) type {
     comptime assertObBase(T);
-    const data_fields = @typeInfo(T).@"struct".fields[1..];
+    const DataType = getDataType(T);
+    const data_fields = @typeInfo(DataType).@"struct".fields;
     const N = data_fields.len;
+    const data_offset = @offsetOf(T, "data");
     comptime var init_array = std.mem.zeroes([N + 1]PyMemberDef);
     inline for (data_fields, 0..) |field, i| {
         init_array[i] = .{
             .name = @ptrCast(field.name.ptr),
             .member_type = memberTypeCode(field.type),
-            .offset = @intCast(@offsetOf(T, field.name)),
+            .offset = @intCast(data_offset + @offsetOf(DataType, field.name)),
             .flags = 0,
             .doc = null,
         };
@@ -220,10 +226,12 @@ pub fn membersArray(comptime T: type) type {
 /// Returns a namespace containing `call`, suitable for use as tp_init.
 ///
 /// Fields are populated in declaration order from positional args, then keyword
-/// args by field name, then comptime defaults from Defaults (if declared).
-/// Use core.NoDefaults when no defaults are needed.
-pub fn initFn(comptime T: type, comptime Defaults: type) type {
+/// args by field name, then comptime defaults from `fname_default` declarations
+/// on the Data struct (e.g. `pub const age_default: i64 = 35;`).
+/// For `?*PyObject` fields, the default must be `[:0]const u8`.
+pub fn initFn(comptime T: type) type {
     comptime assertObBase(T);
+    const DataType = getDataType(T);
     return struct {
         pub fn call(
             self_obj: ?*PyObject,
@@ -232,7 +240,7 @@ pub fn initFn(comptime T: type, comptime Defaults: type) type {
         ) callconv(.c) c_int {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
             const nargs: usize = if (args != null) @intCast(PyTuple_Size(args)) else 0;
-            inline for (@typeInfo(T).@"struct".fields[1..], 0..) |field, i| {
+            inline for (@typeInfo(DataType).@"struct".fields, 0..) |field, i| {
                 const arg: ?*PyObject = if (i < nargs)
                     PyTuple_GetItem(args, @intCast(i))
                 else if (kwargs != null)
@@ -241,17 +249,17 @@ pub fn initFn(comptime T: type, comptime Defaults: type) type {
                     null;
 
                 if (arg != null) {
-                    storeField(field.type, &@field(self, field.name), arg);
+                    storeField(field.type, &@field(self.data, field.name), arg);
                     if (PyErr_Occurred() != null) return -1;
-                } else if (@hasDecl(Defaults, field.name)) {
-                    const dval = @field(Defaults, field.name);
+                } else if (@hasDecl(DataType, field.name ++ "_default")) {
+                    const dval = @field(DataType, field.name ++ "_default");
                     switch (field.type) {
-                        i64 => @field(self, field.name) = @as(i64, dval),
-                        f64 => @field(self, field.name) = @as(f64, dval),
+                        i64 => @field(self.data, field.name) = @as(i64, dval),
+                        f64 => @field(self.data, field.name) = @as(f64, dval),
                         ?*PyObject => {
                             const py_str = PyUnicode_FromString(dval.ptr) orelse return -1;
-                            if (@field(self, field.name)) |old| Py_DecRef(old);
-                            @field(self, field.name) = py_str;
+                            if (@field(self.data, field.name)) |old| Py_DecRef(old);
+                            @field(self.data, field.name) = py_str;
                         },
                         else => @compileError("unsupported default field type: " ++ @typeName(field.type)),
                     }
@@ -297,6 +305,7 @@ pub fn noInitFn() type {
 /// Returns Py_NotImplemented for other ops or when operand types differ.
 pub fn richCompareFn(comptime T: type) type {
     comptime assertObBase(T);
+    const DataType = getDataType(T);
     return struct {
         pub fn call(
             a_obj: ?*PyObject,
@@ -320,15 +329,15 @@ pub fn richCompareFn(comptime T: type) type {
             const a: *const T = @ptrCast(@alignCast(a_obj));
             const b: *const T = @ptrCast(@alignCast(b_obj));
             var equal = true;
-            inline for (@typeInfo(T).@"struct".fields[1..]) |field| {
+            inline for (@typeInfo(DataType).@"struct".fields) |field| {
                 switch (field.type) {
                     i64, f64 => {
-                        if (@field(a, field.name) != @field(b, field.name)) equal = false;
+                        if (@field(a.data, field.name) != @field(b.data, field.name)) equal = false;
                     },
                     ?*PyObject => {
                         const cmp = PyObject_RichCompareBool(
-                            @field(a, field.name),
-                            @field(b, field.name),
+                            @field(a.data, field.name),
+                            @field(b.data, field.name),
                             Py_EQ,
                         );
                         if (cmp < 0) return null;
@@ -352,12 +361,13 @@ pub fn richCompareFn(comptime T: type) type {
 /// Only used for types that have object fields; otherwise tp_dealloc is left null
 /// and PyType_Ready inherits the default from object.
 pub fn deallocFn(comptime T: type) type {
+    const DataType = getDataType(T);
     return struct {
         pub fn call(self_obj: ?*PyObject) callconv(.c) void {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
-            inline for (@typeInfo(T).@"struct".fields[1..]) |field| {
+            inline for (@typeInfo(DataType).@"struct".fields) |field| {
                 if (field.type == ?*PyObject) {
-                    if (@field(self, field.name)) |obj| Py_DecRef(obj);
+                    if (@field(self.data, field.name)) |obj| Py_DecRef(obj);
                 }
             }
             PyObject_Free(self_obj);
@@ -369,25 +379,23 @@ pub fn deallocFn(comptime T: type) type {
 
 /// Options controlling which slots are wired into the generated type.
 /// Mirror the keyword arguments accepted by Python's @dataclass decorator.
-pub const MakeTypeOptions = struct {
+pub const makeTypeOptions = struct {
     /// Wire tp_init; set false when init=False is passed to @zetaclass.
     init: bool = true,
     /// Wire tp_richcompare; set false when eq=False is passed to @zetaclass.
     eq: bool = true,
 };
 
-/// Build a PyTypeObject for extern struct T.
+/// Build a PyTypeObject for an Object struct of the form:
+///   extern struct { ob_base: PyObject, data: SomeDataStruct }
 /// Assign to an `export var` in generated params.zig, then load via load_class().
 ///
-/// Defaults: a struct with pub const fields for each field that has a default.
-/// Use core.NoDefaults when no defaults are needed.
-///
-/// opts: MakeTypeOptions controlling which slots are generated.
+/// Defaults are declared as `pub const fname_default` on the Data struct.
+/// opts: makeTypeOptions controlling which slots are generated.
 pub fn makeTypeObject(
     comptime T: type,
-    comptime Defaults: type,
     comptime name: [:0]const u8,
-    comptime opts: MakeTypeOptions,
+    comptime opts: makeTypeOptions,
 ) PyTypeObject {
     return PyTypeObject{
         .ob_base = .{ .ob_base = .{ .ob_refcnt = 1, .ob_type = null }, .ob_size = 0 },
@@ -429,7 +437,7 @@ pub fn makeTypeObject(
         .tp_descr_set = null,
         .tp_dictoffset = 0,
         .tp_init = if (opts.init)
-            @ptrCast(@constCast(&initFn(T, Defaults).call))
+            @ptrCast(@constCast(&initFn(T).call))
         else
             @ptrCast(@constCast(&noInitFn().call)),
         .tp_alloc = null,
