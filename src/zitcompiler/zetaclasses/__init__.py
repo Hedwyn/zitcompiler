@@ -11,9 +11,23 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
-from typing import get_type_hints
+from typing import TypedDict, Unpack, get_type_hints
 
 from zitcompiler import BuildLibOptions, load_class, zig_build_lib
+
+
+class DataclassKwargs(TypedDict, total=False):
+    init: bool
+    repr: bool
+    eq: bool
+    order: bool
+    unsafe_hash: bool
+    frozen: bool
+    match_args: bool
+    kw_only: bool
+    slots: bool
+    weakref_slot: bool
+
 
 _CORE_ZIG = Path(__file__).parent / "core.zig"
 
@@ -68,12 +82,20 @@ def _generate_params_zig(
     return "\n".join(lines)
 
 
-def zetaclass(cls: type) -> type:
+def zetaclass(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     """Compile and load a native dataclass-compatible type backed by Zig.
 
     Inspects annotations from cls and its bases, compiles a Zig struct with
     native __init__ (including defaults) and __eq__ slots.
+
+    Accepts the same keyword arguments as @dataclass. Any argument other than
+    the defaults raises NotImplementedError until the corresponding feature is
+    implemented.
     """
+    if kwargs:
+        raise NotImplementedError(
+            f"zetaclass: keyword arguments not yet supported: {', '.join(kwargs)}"
+        )
     hints = get_type_hints(cls)
     field_names = list(hints.keys())
     field_pairs = [(n, hints[n]) for n in field_names]
