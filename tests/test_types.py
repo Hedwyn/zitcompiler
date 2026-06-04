@@ -164,8 +164,8 @@ def test_get_zig_type_with_annotation() -> None:
     [
         pytest.param(int, "i64", id="int"),
         pytest.param(float, "f64", id="float"),
-        pytest.param(str, "const [] u8", id="str"),
-        pytest.param(bytes, "const [] u8", id="bytes"),
+        pytest.param(str, "[]const u8", id="str"),
+        pytest.param(bytes, "[]const u8", id="bytes"),
     ],
 )
 def test_get_zig_type_builtin(builtin_type: type, expected_zig_type: str) -> None:

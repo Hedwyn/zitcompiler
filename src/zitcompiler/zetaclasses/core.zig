@@ -4,25 +4,23 @@
 //!
 //!   const core = @import("core");
 //!
-//!   const PersonData = extern struct {
-//!       name: ?*core.PyObject,
-//!       age: i64,
-//!       height: f64,
+//!   const PersonData = struct {
+//!       name: []const u8,
+//!       age: i64 = 35,
+//!       height: f64 = 1.77,
 //!       pub const name_default: [:0]const u8 = "John";
-//!       pub const age_default: i64 = 35;
-//!       pub const height_default: f64 = 1.77;
 //!   };
 //!
-//!   pub const PersonObject = extern struct {
-//!       ob_base: core.PyObject,
-//!       data: PersonData,
-//!   };
+//!   pub const PersonObject = core.wrapAsPythonObject(PersonData);
 //!
 //!   pub export var PersonType: core.PyTypeObject =
 //!       core.makeTypeObject(PersonObject, "Person", .{});
 //!
-//! Fields with no default simply omit the `pub const` declaration; missing
-//! arguments at init time will raise TypeError.
+//! i64/f64 defaults use Zig inline field syntax. []const u8 defaults use a
+//! `pub const fname_default: [:0]const u8` declaration; the bytes are copied
+//! to heap memory owned by the struct instance.
+//! Fields with no default simply omit the declaration; missing arguments at
+//! init time will raise TypeError.
 //! @date: 04.06.2026
 //! @author: Baptiste Pestourie
 
@@ -60,6 +58,14 @@ pub const PyMemberDef = extern struct {
     doc: ?[*:0]const u8,
 };
 
+pub const PyGetSetDef = extern struct {
+    name: ?[*:0]const u8,
+    get: ?*anyopaque,
+    set: ?*anyopaque,
+    doc: ?[*:0]const u8,
+    closure: ?*anyopaque,
+};
+
 const NewFunc = *const fn (*PyTypeObject, ?*PyObject, ?*PyObject) callconv(.c) ?*PyObject;
 
 pub const PyTypeObject = extern struct {
@@ -92,7 +98,7 @@ pub const PyTypeObject = extern struct {
     tp_iternext: ?*anyopaque,
     tp_methods: ?[*]PyMethodDef,
     tp_members: ?[*]PyMemberDef,
-    tp_getset: ?*anyopaque,
+    tp_getset: ?[*]PyGetSetDef,
     tp_base: ?*PyTypeObject,
     tp_dict: ?*PyObject,
     tp_descr_get: ?*anyopaque,
@@ -131,10 +137,12 @@ extern fn PyErr_SetString(exc: ?*PyObject, msg: [*:0]const u8) void;
 extern fn PyErr_Occurred() ?*PyObject;
 extern fn PyObject_RichCompareBool(a: ?*PyObject, b: ?*PyObject, op: c_int) c_int;
 extern fn PyObject_Free(ptr: ?*anyopaque) void;
-extern fn PyUnicode_FromString(s: [*:0]const u8) ?*PyObject;
+extern fn PyUnicode_AsUTF8AndSize(unicode: ?*PyObject, size: *Py_ssize_t) ?[*]const u8;
+extern fn PyUnicode_FromStringAndSize(u: ?[*]const u8, size: Py_ssize_t) ?*PyObject;
+extern fn PyMem_Malloc(n: usize) ?*anyopaque;
+extern fn PyMem_Free(p: ?*anyopaque) void;
 extern var PyExc_TypeError: *PyObject;
-extern fn Py_IncRef(obj: ?*PyObject) void;
-extern fn Py_DecRef(obj: ?*PyObject) void;
+extern var PyExc_MemoryError: *PyObject;
 extern var _Py_TrueStruct: PyObject;
 extern var _Py_FalseStruct: PyObject;
 extern var _Py_NotImplementedStruct: PyObject;
@@ -144,7 +152,6 @@ const Py_NE: c_int = 3;
 
 // PyMemberDef type codes (descrobject.h, Python 3.12+; structmember.h aliases these)
 const Py_T_DOUBLE: c_int = 4;
-const Py_T_OBJECT_EX: c_int = 16;
 const Py_T_LONGLONG: c_int = 17;
 
 // ── Public comptime helpers ───────────────────────────────────────────────────
@@ -152,10 +159,12 @@ const Py_T_LONGLONG: c_int = 17;
 /// Wraps a data struct as a Python object struct by prepending `ob_base: PyObject`.
 /// The returned type is suitable for use as the Object struct in makeTypeObject.
 pub fn wrapAsPythonObject(comptime DataType: type) type {
-    return extern struct {
+    const T = struct {
         ob_base: PyObject,
         data: DataType,
     };
+    comptime std.debug.assert(@offsetOf(T, "ob_base") == 0);
+    return T;
 }
 
 // ── Internal comptime helpers ─────────────────────────────────────────────────
@@ -178,29 +187,40 @@ fn memberTypeCode(comptime FieldType: type) c_int {
     return switch (FieldType) {
         i64 => Py_T_LONGLONG,
         f64 => Py_T_DOUBLE,
-        ?*PyObject => Py_T_OBJECT_EX,
-        else => @compileError("unsupported zetaclass field type: " ++ @typeName(FieldType)),
+        else => @compileError("unsupported zetaclass field type for tp_members: " ++ @typeName(FieldType)),
     };
 }
 
-fn hasObjectFields(comptime T: type) bool {
+fn hasStringFields(comptime T: type) bool {
     const DataType = getDataType(T);
     inline for (@typeInfo(DataType).@"struct".fields) |field| {
-        if (field.type == ?*PyObject) return true;
+        if (field.type == []const u8) return true;
     }
     return false;
 }
 
-// Store a Python arg into a struct field, handling ref counting for object fields.
-// Decrefs the current value first (handles re-initialization).
+// Store a Python arg into a struct field.
+// For []const u8: extracts UTF-8 bytes, frees the previous allocation, copies to new heap buffer.
 fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void {
     switch (FieldType) {
         i64 => dest.* = @as(i64, @intCast(PyLong_AsLongLong(arg))),
         f64 => dest.* = PyFloat_AsDouble(arg),
-        ?*PyObject => {
-            if (dest.*) |old| Py_DecRef(old);
-            Py_IncRef(arg);
-            dest.* = arg;
+        []const u8 => {
+            var size: Py_ssize_t = 0;
+            const ptr = PyUnicode_AsUTF8AndSize(arg, &size) orelse return;
+            const n: usize = @intCast(size);
+            const old = dest.*;
+            if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
+            if (n == 0) {
+                dest.* = "";
+                return;
+            }
+            const buf: [*]u8 = @ptrCast(PyMem_Malloc(n) orelse {
+                PyErr_SetString(PyExc_MemoryError, "zetaclass: out of memory for string field");
+                return;
+            });
+            @memcpy(buf[0..n], ptr[0..n]);
+            dest.* = buf[0..n];
         },
         else => @compileError("unsupported zetaclass field type: " ++ @typeName(FieldType)),
     }
@@ -208,27 +228,97 @@ fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void 
 
 // ── tp_members array ──────────────────────────────────────────────────────────
 
-/// Returns a namespace with a static `array: [N+1]PyMemberDef` for struct T.
-/// The array is null-sentinel terminated and can be passed directly to tp_members.
+/// Returns a namespace with a static `array: [N+1]PyMemberDef` for numeric fields.
+/// []const u8 (string) fields are excluded — they are exposed via tp_getset instead.
 pub fn membersArray(comptime T: type) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
     const data_fields = @typeInfo(DataType).@"struct".fields;
-    const N = data_fields.len;
     const data_offset = @offsetOf(T, "data");
-    comptime var init_array = std.mem.zeroes([N + 1]PyMemberDef);
-    inline for (data_fields, 0..) |field, i| {
-        init_array[i] = .{
-            .name = @ptrCast(field.name.ptr),
-            .member_type = memberTypeCode(field.type),
-            .offset = @intCast(data_offset + @offsetOf(DataType, field.name)),
-            .flags = 0,
-            .doc = null,
-        };
+
+    comptime var N: usize = 0;
+    inline for (data_fields) |field| {
+        if (field.type != []const u8) N += 1;
+    }
+
+    comptime var init_array: [N + 1]PyMemberDef = std.mem.zeroes([N + 1]PyMemberDef);
+    comptime var idx: usize = 0;
+    inline for (data_fields) |field| {
+        if (field.type != []const u8) {
+            init_array[idx] = .{
+                .name = @ptrCast(field.name.ptr),
+                .member_type = memberTypeCode(field.type),
+                .offset = @intCast(data_offset + @offsetOf(DataType, field.name)),
+                .flags = 0,
+                .doc = null,
+            };
+            idx += 1;
+        }
     }
     const members_init = init_array;
     return struct {
         pub var array: [N + 1]PyMemberDef = members_init;
+    };
+}
+
+// ── tp_getset array ───────────────────────────────────────────────────────────
+
+/// Returns a namespace with a static `array: [N+1]PyGetSetDef` for []const u8 fields.
+/// The getter returns a new Python str from the stored bytes.
+/// The setter extracts UTF-8 bytes, frees the old buffer, copies the new bytes.
+pub fn getsetArray(comptime T: type) type {
+    comptime assertObBase(T);
+    const DataType = getDataType(T);
+    const data_fields = @typeInfo(DataType).@"struct".fields;
+
+    comptime var N: usize = 0;
+    inline for (data_fields) |field| {
+        if (field.type == []const u8) N += 1;
+    }
+
+    comptime var init_array: [N + 1]PyGetSetDef = std.mem.zeroes([N + 1]PyGetSetDef);
+    comptime var idx: usize = 0;
+    inline for (data_fields) |field| {
+        if (field.type == []const u8) {
+            const FieldAccessor = struct {
+                fn get(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
+                    const self: *T = @ptrCast(@alignCast(self_obj.?));
+                    const s = @field(self.data, field.name);
+                    return PyUnicode_FromStringAndSize(s.ptr, @intCast(s.len));
+                }
+                fn set(self_obj: ?*PyObject, value: ?*PyObject, _: ?*anyopaque) callconv(.c) c_int {
+                    const self: *T = @ptrCast(@alignCast(self_obj.?));
+                    var size: Py_ssize_t = 0;
+                    const ptr = PyUnicode_AsUTF8AndSize(value, &size) orelse return -1;
+                    const n: usize = @intCast(size);
+                    const old = @field(self.data, field.name);
+                    if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
+                    if (n == 0) {
+                        @field(self.data, field.name) = "";
+                        return 0;
+                    }
+                    const buf: [*]u8 = @ptrCast(PyMem_Malloc(n) orelse {
+                        PyErr_SetString(PyExc_MemoryError, "zetaclass: out of memory for string setter");
+                        return -1;
+                    });
+                    @memcpy(buf[0..n], ptr[0..n]);
+                    @field(self.data, field.name) = buf[0..n];
+                    return 0;
+                }
+            };
+            init_array[idx] = .{
+                .name = @ptrCast(field.name.ptr),
+                .get = @constCast(@ptrCast(&FieldAccessor.get)),
+                .set = @constCast(@ptrCast(&FieldAccessor.set)),
+                .doc = null,
+                .closure = null,
+            };
+            idx += 1;
+        }
+    }
+    const getset_init = init_array;
+    return struct {
+        pub var array: [N + 1]PyGetSetDef = getset_init;
     };
 }
 
@@ -237,9 +327,9 @@ pub fn membersArray(comptime T: type) type {
 /// Returns a namespace containing `call`, suitable for use as tp_init.
 ///
 /// Fields are populated in declaration order from positional args, then keyword
-/// args by field name, then comptime defaults from `fname_default` declarations
-/// on the Data struct (e.g. `pub const age_default: i64 = 35;`).
-/// For `?*PyObject` fields, the default must be `[:0]const u8`.
+/// args by field name, then defaults:
+///   - []const u8 fields: `pub const fname_default: [:0]const u8` declaration
+///   - i64/f64 fields: inline struct field default via field.defaultValue()
 pub fn initFn(comptime T: type) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
@@ -262,18 +352,23 @@ pub fn initFn(comptime T: type) type {
                 if (arg != null) {
                     storeField(field.type, &@field(self.data, field.name), arg);
                     if (PyErr_Occurred() != null) return -1;
-                } else if (@hasDecl(DataType, field.name ++ "_default")) {
-                    const dval = @field(DataType, field.name ++ "_default");
-                    switch (field.type) {
-                        i64 => @field(self.data, field.name) = @as(i64, dval),
-                        f64 => @field(self.data, field.name) = @as(f64, dval),
-                        ?*PyObject => {
-                            const py_str = PyUnicode_FromString(dval.ptr) orelse return -1;
-                            if (@field(self.data, field.name)) |old| Py_DecRef(old);
-                            @field(self.data, field.name) = py_str;
-                        },
-                        else => @compileError("unsupported default field type: " ++ @typeName(field.type)),
+                } else if (field.type == []const u8 and @hasDecl(DataType, field.name ++ "_default")) {
+                    const dval: [:0]const u8 = @field(DataType, field.name ++ "_default");
+                    const n = dval.len;
+                    const old = @field(self.data, field.name);
+                    if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
+                    if (n == 0) {
+                        @field(self.data, field.name) = "";
+                    } else {
+                        const buf: [*]u8 = @ptrCast(PyMem_Malloc(n) orelse {
+                            PyErr_SetString(PyExc_MemoryError, "zetaclass __init__: out of memory for string default");
+                            return -1;
+                        });
+                        @memcpy(buf[0..n], dval[0..n]);
+                        @field(self.data, field.name) = buf[0..n];
                     }
+                } else if (field.defaultValue()) |dv| {
+                    @field(self.data, field.name) = dv;
                 } else {
                     PyErr_SetString(PyExc_TypeError, "zetaclass __init__: missing required argument");
                     return -1;
@@ -345,14 +440,8 @@ pub fn richCompareFn(comptime T: type) type {
                     i64, f64 => {
                         if (@field(a.data, field.name) != @field(b.data, field.name)) equal = false;
                     },
-                    ?*PyObject => {
-                        const cmp = PyObject_RichCompareBool(
-                            @field(a.data, field.name),
-                            @field(b.data, field.name),
-                            Py_EQ,
-                        );
-                        if (cmp < 0) return null;
-                        if (cmp == 0) equal = false;
+                    []const u8 => {
+                        if (!std.mem.eql(u8, @field(a.data, field.name), @field(b.data, field.name))) equal = false;
                     },
                     else => @compileError("unsupported field type: " ++ @typeName(field.type)),
                 }
@@ -368,8 +457,8 @@ pub fn richCompareFn(comptime T: type) type {
 // ── tp_dealloc ────────────────────────────────────────────────────────────────
 
 /// Returns a namespace containing `call` for tp_dealloc.
-/// Decrefs all ?*PyObject fields, then frees the object memory.
-/// Only used for types that have object fields; otherwise tp_dealloc is left null
+/// Frees heap-allocated []const u8 fields, then frees the object memory.
+/// Only used for types that have string fields; otherwise tp_dealloc is left null
 /// and PyType_Ready inherits the default from object.
 pub fn deallocFn(comptime T: type) type {
     const DataType = getDataType(T);
@@ -377,14 +466,19 @@ pub fn deallocFn(comptime T: type) type {
         pub fn call(self_obj: ?*PyObject) callconv(.c) void {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
             inline for (@typeInfo(DataType).@"struct".fields) |field| {
-                if (field.type == ?*PyObject) {
-                    if (@field(self.data, field.name)) |obj| Py_DecRef(obj);
+                if (field.type == []const u8) {
+                    const s = @field(self.data, field.name);
+                    if (s.len > 0) PyMem_Free(@ptrCast(@constCast(s.ptr)));
                 }
             }
             PyObject_Free(self_obj);
         }
     };
 }
+
+// These are kept for use by custom Zig code that may reference PyObject fields directly.
+extern fn Py_IncRef(obj: ?*PyObject) void;
+extern fn Py_DecRef(obj: ?*PyObject) void;
 
 // ── makeTypeObject ────────────────────────────────────────────────────────────
 
@@ -398,10 +492,11 @@ pub const makeTypeOptions = struct {
 };
 
 /// Build a PyTypeObject for an Object struct of the form:
-///   extern struct { ob_base: PyObject, data: SomeDataStruct }
+///   struct { ob_base: PyObject, data: SomeDataStruct }
 /// Assign to an `export var` in generated params.zig, then load via load_class().
 ///
-/// Defaults are declared as `pub const fname_default` on the Data struct.
+/// String ([]const u8) defaults are declared as `pub const fname_default: [:0]const u8`.
+/// Numeric defaults use Zig inline field syntax.
 /// opts: makeTypeOptions controlling which slots are generated.
 pub fn makeTypeObject(
     comptime T: type,
@@ -413,7 +508,7 @@ pub fn makeTypeObject(
         .tp_name = name.ptr,
         .tp_basicsize = @sizeOf(T),
         .tp_itemsize = 0,
-        .tp_dealloc = if (hasObjectFields(T))
+        .tp_dealloc = if (hasStringFields(T))
             @ptrCast(@constCast(&deallocFn(T).call))
         else
             null,
@@ -441,7 +536,7 @@ pub fn makeTypeObject(
         .tp_iternext = null,
         .tp_methods = null,
         .tp_members = &membersArray(T).array,
-        .tp_getset = null,
+        .tp_getset = if (hasStringFields(T)) &getsetArray(T).array else null,
         .tp_base = null,
         .tp_dict = null,
         .tp_descr_get = null,

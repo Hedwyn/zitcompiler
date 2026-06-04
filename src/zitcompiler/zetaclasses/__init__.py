@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, Unpack, get_type_hints
 
 from zitcompiler import BuildLibOptions, load_class, zig_build_lib
+from zitcompiler._types import ZIG_TYPE_MAP, _zig_default_decl, get_zig_type
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,24 +36,6 @@ class DataclassKwargs(TypedDict, total=False):
 
 _CORE_ZIG = Path(__file__).parent / "core.zig"
 
-_ZIG_FIELD_TYPES: dict[type, str] = {
-    int: "i64",
-    float: "f64",
-    str: "?*core.PyObject",
-}
-
-
-def _zig_default_decl[T](fname: str, ftype: type[T], value: T) -> str:
-    if ftype is int:
-        return f"    pub const {fname}_default: i64 = {int(value)};"
-    elif ftype is float:
-        return f"    pub const {fname}_default: f64 = {float(value)!r};"
-    elif ftype is str:
-        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-        return f'    pub const {fname}_default: [:0]const u8 = "{escaped}";'
-    else:
-        raise TypeError(f"unsupported default type {ftype!r}")
-
 
 def _generate_params_zig(
     class_name: str,
@@ -65,11 +48,24 @@ def _generate_params_zig(
     lines = ['const core = @import("core");', ""]
 
     data_type = f"{class_name}Data"
-    lines.append(f"const {data_type} = extern struct {{")
+    lines.append(f"const {data_type} = struct {{")
     for fname, ftype in field_pairs:
-        lines.append(f"    {fname}: {_ZIG_FIELD_TYPES[ftype]},")
+        zig_type = get_zig_type(ftype)
+        if fname in defaults and ftype is not str:
+            val = defaults[fname]
+            if ftype is int:
+                assert isinstance(val, int)
+                zig_val = str(val)
+            elif ftype is float:
+                assert isinstance(val, (int, float))
+                zig_val = repr(float(val))
+            else:
+                raise TypeError(f"zetaclass: inline defaults not supported for {ftype!r}")
+            lines.append(f"    {fname}: {zig_type} = {zig_val},")
+        else:
+            lines.append(f"    {fname}: {zig_type},")
     for fname, ftype in field_pairs:
-        if fname in defaults:
+        if fname in defaults and ftype is str:
             lines.append(_zig_default_decl(fname, ftype, defaults[fname]))
     lines.append("};")
     lines.append("")
@@ -100,7 +96,7 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     field_pairs = [(n, hints[n]) for n in field_names]
 
     for _, ftype in field_pairs:
-        if ftype not in _ZIG_FIELD_TYPES:
+        if ftype not in ZIG_TYPE_MAP:
             raise TypeError(f"zetaclass: unsupported field type {ftype!r}")
 
     # Collect defaults by walking MRO (closest definition wins)
