@@ -5,7 +5,7 @@ Verifies that they match dataclasses behavior.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 
 import pytest
 
@@ -84,6 +84,73 @@ class PointNoEqDatacls(_Point): ...
 
 @zetaclass(eq=False)
 class PointNoEqZetacls(_Point): ...
+
+
+# ── dataclass fields ──────────────────────────────────────────────────────────
+
+
+@dataclass()
+class WithDefaultsDatacls:
+    required: float
+    age: int = 35
+    label: str = "hello"
+    score: float = 1.5
+
+
+@zetaclass
+class WithDefaultsZetacls:
+    required: float
+    age: int = 35
+    label: str = "hello"
+    score: float = 1.5
+
+
+@zetaclass
+class RequiredAfterDefaults:
+    age: int = 35
+    label: str = "hello"
+    score: float = 1.5
+    required: float
+
+
+def test_fields_on_type() -> None:
+    dc_fields = {f.name: f for f in fields(WithDefaultsDatacls)}
+    zc_fields = {f.name: f for f in fields(WithDefaultsZetacls)}
+
+    assert set(dc_fields) == set(zc_fields)
+    for name, dc_f in dc_fields.items():
+        zc_f = zc_fields[name]
+        assert zc_f.name == dc_f.name
+        assert zc_f.default == dc_f.default
+    # zetaclass resolves annotations via get_type_hints, so Field.type holds the
+    # actual type object rather than a string (as @dataclass does under PEP 563)
+    expected_types: dict[str, type] = {"required": float, "age": int, "label": str, "score": float}
+    for name, zc_f in zc_fields.items():
+        assert zc_f.type == expected_types[name]
+
+
+def test_fields_on_instance() -> None:
+    instance = WithDefaultsZetacls(required=0.0)
+    assert fields(instance) == fields(WithDefaultsZetacls)
+
+
+def test_fields_required_has_missing_default() -> None:
+    zc_f = {f.name: f for f in fields(WithDefaultsZetacls)}["required"]
+    assert zc_f.default is MISSING
+    assert zc_f.default_factory is MISSING  # type: ignore[misc]
+
+
+def test_fields_with_defaults_match_values() -> None:
+    zc_fields = {f.name: f for f in fields(WithDefaultsZetacls)}
+    assert zc_fields["age"].default == 35
+    assert zc_fields["label"].default == "hello"
+    assert zc_fields["score"].default == 1.5
+
+
+def test_fields_required_after_defaults() -> None:
+    zc_fields = {f.name: f for f in fields(RequiredAfterDefaults)}
+    assert zc_fields["required"].default is MISSING
+    assert zc_fields["age"].default == 35
 
 
 def test_no_eq_uses_identity() -> None:

@@ -149,6 +149,7 @@ extern var _Py_NotImplementedStruct: PyObject;
 
 const Py_EQ: c_int = 2;
 const Py_NE: c_int = 3;
+const Py_TPFLAGS_BASETYPE: c_ulong = 1 << 10;
 
 // PyMemberDef type codes (descrobject.h, Python 3.12+; structmember.h aliases these)
 const Py_T_DOUBLE: c_int = 4;
@@ -526,7 +527,7 @@ pub fn makeTypeObject(
         .tp_getattro = null,
         .tp_setattro = null,
         .tp_as_buffer = null,
-        .tp_flags = 0,
+        .tp_flags = Py_TPFLAGS_BASETYPE,
         .tp_doc = null,
         .tp_traverse = null,
         .tp_clear = null,

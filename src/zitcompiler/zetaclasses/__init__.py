@@ -9,6 +9,7 @@ Populates the dataclass-like methods with native code.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import tempfile
 from pathlib import Path
@@ -131,7 +132,12 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             extra_deps={"core": _CORE_ZIG},
         )
         so_path = asyncio.run(zig_build_lib(build_opts))
-        return load_class(so_path, f"{class_name}Type")
+        native_type = load_class(so_path, f"{class_name}Type")
+
+    cls.__annotations__ = {n: t for n, t in field_pairs}
+    dataclasses.dataclass(cls, init=False, eq=False, repr=False)
+    dc_fields: dict[str, object] = getattr(cls, "__dataclass_fields__")
+    return type(class_name, (native_type,), {"__dataclass_fields__": dc_fields})
 
 
 def zetaclass(
