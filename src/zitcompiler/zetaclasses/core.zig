@@ -346,7 +346,7 @@ pub fn getsetArray(comptime T: type, comptime frozen: bool) type {
 /// Fields are populated in declaration order from positional args, then keyword
 /// args by field name, then inline struct field defaults via field.defaultValue().
 /// [:0]const u8 defaults are heap-copied to maintain the ownership invariant.
-pub fn initFn(comptime T: type) type {
+pub fn initFn(comptime T: type, comptime kw_only: bool) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
     return struct {
@@ -357,8 +357,12 @@ pub fn initFn(comptime T: type) type {
         ) callconv(.c) c_int {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
             const nargs: usize = if (args != null) @intCast(PyTuple_Size(args)) else 0;
+            if (kw_only and nargs > 0) {
+                PyErr_SetString(PyExc_TypeError, "zetaclass __init__() takes 0 positional arguments (kw_only=True)");
+                return -1;
+            }
             inline for (@typeInfo(DataType).@"struct".fields, 0..) |field, i| {
-                const arg: ?*PyObject = if (i < nargs)
+                const arg: ?*PyObject = if (!kw_only and i < nargs)
                     PyTuple_GetItem(args, @intCast(i))
                 else if (kwargs != null)
                     PyDict_GetItemString(kwargs, @as([*:0]const u8, @ptrCast(field.name.ptr)))
@@ -615,6 +619,10 @@ pub const makeTypeOptions = struct {
     hash: bool = false,
     /// Wire tp_setattro to reject mutation; set when frozen=True.
     frozen: bool = false,
+    /// Force __init__ to accept keyword arguments only (no positional args).
+    kw_only: bool = false,
+    /// Add Py_TPFLAGS_MANAGED_WEAKREF to enable weakref support.
+    weakref_slot: bool = false,
 };
 
 /// Build a PyTypeObject for an Object struct of the form:
@@ -652,7 +660,7 @@ pub fn makeTypeObject(
         .tp_getattro = null,
         .tp_setattro = if (opts.frozen) @ptrCast(@constCast(&frozenSetAttrFn().call)) else null,
         .tp_as_buffer = null,
-        .tp_flags = Py_TPFLAGS_BASETYPE,
+        .tp_flags = Py_TPFLAGS_BASETYPE | (if (opts.weakref_slot) Py_TPFLAGS_MANAGED_WEAKREF else 0),
         .tp_doc = null,
         .tp_traverse = null,
         .tp_clear = null,
@@ -669,7 +677,7 @@ pub fn makeTypeObject(
         .tp_descr_set = null,
         .tp_dictoffset = 0,
         .tp_init = if (opts.init)
-            @ptrCast(@constCast(&initFn(T).call))
+            @ptrCast(@constCast(&initFn(T, opts.kw_only).call))
         else
             @ptrCast(@constCast(&noInitFn().call)),
         .tp_alloc = null,

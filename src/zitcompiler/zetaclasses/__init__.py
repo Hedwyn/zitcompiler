@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import os
 import tempfile
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, Unpack, get_type_hints
 
@@ -49,11 +50,18 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     order = kwargs.pop("order", False)
     frozen = kwargs.pop("frozen", False)
     unsafe_hash = kwargs.pop("unsafe_hash", False)
+    kw_only = kwargs.pop("kw_only", False)
+    weakref_slot = kwargs.pop("weakref_slot", False)
     kwargs.pop("repr", True)  # TODO: not yet implemented
     kwargs.pop("match_args", True)  # TODO: not yet implemented
-    kwargs.pop("kw_only", False)  # TODO: not yet implemented
-    kwargs.pop("slots", False)  # no-op: native struct is always slotted
-    kwargs.pop("weakref_slot", False)  # TODO: not yet implemented
+    if "slots" in kwargs:
+        if not kwargs.pop("slots"):
+            warnings.warn(
+                "zetaclass: slots=False has no effect; native struct layout is always slotted",
+                UserWarning,
+                stacklevel=3,
+            )
+    kwargs.pop("slots", None)
     if kwargs:
         raise NotImplementedError(
             f"zetaclass: keyword arguments not yet supported: {', '.join(sorted(kwargs))}",
@@ -97,7 +105,8 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             f"pub export var {class_name}Type: core.PyTypeObject = "
             f'core.makeTypeObject({class_name}Object, "{class_name}", '
             f".{{ .init = {_make_boolean(init)}, .eq = {_make_boolean(eq)}, .order = {_make_boolean(order)}, "
-            f".hash = {_make_boolean(hash_opt)}, .frozen = {_make_boolean(frozen)} }});",
+            f".hash = {_make_boolean(hash_opt)}, .frozen = {_make_boolean(frozen)}, "
+            f".kw_only = {_make_boolean(kw_only)}, .weakref_slot = {_make_boolean(weakref_slot)} }});",
         ]
     )
 

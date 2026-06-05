@@ -5,6 +5,8 @@ Verifies that they match dataclasses behavior.
 
 from __future__ import annotations
 
+import warnings
+import weakref
 from dataclasses import MISSING, dataclass, fields
 
 import pytest
@@ -305,3 +307,87 @@ def test_unsafe_hash_mutable() -> None:
         obj = cls(1)
         obj.count = 99
         assert obj.count == 99
+
+
+# ── kw_only=True ──────────────────────────────────────────────────────────────
+
+
+@dataclass(kw_only=True)
+class KwOnlyDatacls:
+    host: str = "localhost"
+    port: int = 8080
+
+
+@zetaclass(kw_only=True)
+class KwOnlyZetacls:
+    host: str = "localhost"
+    port: int = 8080
+
+
+def test_kw_only_accepts_keyword_args() -> None:
+    for cls in (KwOnlyDatacls, KwOnlyZetacls):
+        obj = cls(host="example.com", port=443)
+        assert obj.host == "example.com"
+        assert obj.port == 443
+
+
+def test_kw_only_rejects_positional_args() -> None:
+    for cls in (KwOnlyDatacls, KwOnlyZetacls):
+        with pytest.raises(TypeError):
+            cls("example.com", 443)  # type: ignore[call-arg]
+
+
+def test_kw_only_uses_defaults() -> None:
+    for cls in (KwOnlyDatacls, KwOnlyZetacls):
+        obj = cls()
+        assert obj.host == "localhost"
+        assert obj.port == 8080
+
+
+# ── weakref_slot=True ─────────────────────────────────────────────────────────
+
+
+@zetaclass(weakref_slot=True)
+class WeakrefNode:
+    value: int = 0
+
+
+def test_weakref_slot_supports_weakref() -> None:
+    node = WeakrefNode(42)
+    ref = weakref.ref(node)
+    assert ref() is node
+    assert ref().value == 42  # type: ignore[union-attr]
+
+
+def test_weakref_slot_ref_clears_on_delete() -> None:
+    node = WeakrefNode(1)
+    ref = weakref.ref(node)
+    del node
+    assert ref() is None
+
+
+# ── slots=False warning ───────────────────────────────────────────────────────
+
+
+def test_slots_false_emits_warning() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+
+        @zetaclass(slots=False)
+        class _Dummy:
+            x: int = 0
+
+    assert len(caught) == 1
+    assert issubclass(caught[0].category, UserWarning)
+    assert "slots" in str(caught[0].message).lower()
+
+
+def test_slots_true_no_warning() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+
+        @zetaclass(slots=True)
+        class _Dummy:
+            x: int = 0
+
+    assert len(caught) == 0
