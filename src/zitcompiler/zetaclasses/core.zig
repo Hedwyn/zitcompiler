@@ -137,6 +137,9 @@ extern fn PyErr_SetString(exc: ?*PyObject, msg: [*:0]const u8) void;
 extern fn PyErr_Occurred() ?*PyObject;
 extern fn PyObject_RichCompareBool(a: ?*PyObject, b: ?*PyObject, op: c_int) c_int;
 extern fn PyObject_Free(ptr: ?*anyopaque) void;
+extern fn PyObject_GC_UnTrack(op: ?*anyopaque) void;
+extern fn PyObject_ClearManagedDict(op: ?*PyObject) void;
+extern fn PyObject_ClearWeakRefs(op: ?*PyObject) void;
 extern fn PyUnicode_AsUTF8AndSize(unicode: ?*PyObject, size: *Py_ssize_t) ?[*]const u8;
 extern fn PyUnicode_FromStringAndSize(u: ?[*]const u8, size: Py_ssize_t) ?*PyObject;
 extern fn PyMem_Malloc(n: usize) ?*anyopaque;
@@ -150,6 +153,10 @@ extern var _Py_NotImplementedStruct: PyObject;
 const Py_EQ: c_int = 2;
 const Py_NE: c_int = 3;
 const Py_TPFLAGS_BASETYPE: c_ulong = 1 << 10;
+const Py_TPFLAGS_MANAGED_WEAKREF: c_ulong = 1 << 3;
+const Py_TPFLAGS_MANAGED_DICT: c_ulong = 1 << 4;
+const Py_TPFLAGS_HEAPTYPE: c_ulong = 1 << 9;
+const Py_TPFLAGS_HAVE_GC: c_ulong = 1 << 14;
 
 // PyMemberDef type codes (descrobject.h, Python 3.12+; structmember.h aliases these)
 const Py_T_DOUBLE: c_int = 4;
@@ -461,18 +468,52 @@ pub fn richCompareFn(comptime T: type) type {
 /// Frees heap-allocated []const u8 fields, then frees the object memory.
 /// Only used for types that have string fields; otherwise tp_dealloc is left null
 /// and PyType_Ready inherits the default from object.
+///
+/// This deallocator is inherited by Python-level subclasses created via
+/// `type(name, (NativeType,), ...)` (which is how @zetaclass produces the final
+/// type). Such subclasses are heap types: they add a managed __dict__ and the
+/// Py_TPFLAGS_HAVE_GC flag, so their instances are GC-tracked and allocated with a
+/// gc_head prefix. It must therefore mirror CPython's subtype_dealloc: untrack from
+/// the GC list, release the managed dict/weakrefs, free via the type's own tp_free
+/// (PyObject_GC_Del for GC types — NOT PyObject_Free, which would free the wrong
+/// block), and drop the instance's reference to its heap type.
 pub fn deallocFn(comptime T: type) type {
     const DataType = getDataType(T);
     return struct {
         pub fn call(self_obj: ?*PyObject) callconv(.c) void {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
+            const hdr: *PyObject = @ptrCast(@alignCast(self_obj.?));
+            const tp: *PyTypeObject = @ptrCast(@alignCast(hdr.ob_type.?));
+
+            // Remove from the GC list before freeing, or the next collection
+            // walks a dangling gc_head and crashes.
+            if ((tp.tp_flags & Py_TPFLAGS_HAVE_GC) != 0) {
+                PyObject_GC_UnTrack(@ptrCast(self_obj));
+            }
+            if ((tp.tp_flags & Py_TPFLAGS_MANAGED_WEAKREF) != 0) {
+                PyObject_ClearWeakRefs(self_obj);
+            }
+
             inline for (@typeInfo(DataType).@"struct".fields) |field| {
                 if (field.type == []const u8) {
                     const s = @field(self.data, field.name);
                     if (s.len > 0) PyMem_Free(@ptrCast(@constCast(s.ptr)));
                 }
             }
-            PyObject_Free(self_obj);
+
+            // Subclasses created from Python carry a managed __dict__ that the
+            // base type's deallocator owns the release of.
+            if ((tp.tp_flags & Py_TPFLAGS_MANAGED_DICT) != 0) {
+                PyObject_ClearManagedDict(self_obj);
+            }
+
+            const free_fn: *const fn (?*anyopaque) callconv(.c) void = @ptrCast(tp.tp_free.?);
+            free_fn(self_obj);
+
+            // Instances of a heap type hold a strong reference to that type.
+            if ((tp.tp_flags & Py_TPFLAGS_HEAPTYPE) != 0) {
+                Py_DecRef(@ptrCast(tp));
+            }
         }
     };
 }
