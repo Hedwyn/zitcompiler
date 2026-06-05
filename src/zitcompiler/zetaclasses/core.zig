@@ -136,6 +136,8 @@ extern fn PyErr_SetString(exc: ?*PyObject, msg: [*:0]const u8) void;
 extern fn PyErr_Occurred() ?*PyObject;
 extern fn PyObject_RichCompareBool(a: ?*PyObject, b: ?*PyObject, op: c_int) c_int;
 extern fn PyObject_Free(ptr: ?*anyopaque) void;
+extern fn PyObject_Repr(obj: ?*PyObject) ?*PyObject;
+extern fn PyUnicode_Concat(left: ?*PyObject, right: ?*PyObject) ?*PyObject;
 extern fn PyLong_FromLongLong(v: c_longlong) ?*PyObject;
 extern fn PyFloat_FromDouble(v: f64) ?*PyObject;
 extern fn PyObject_GC_UnTrack(op: ?*anyopaque) void;
@@ -502,6 +504,70 @@ pub fn richCompareFn(comptime T: type, comptime order: bool) type {
     };
 }
 
+// ── string builder helper ─────────────────────────────────────────────────────
+
+/// Appends `piece` onto `*acc` via PyUnicode_Concat, consuming both references.
+/// If either is null (a prior operation failed), propagates null through `*acc`.
+fn appendConcat(acc: *?*PyObject, piece: ?*PyObject) void {
+    if (acc.* == null) {
+        if (piece) |p| Py_DecRef(p);
+        return;
+    }
+    if (piece == null) {
+        Py_DecRef(acc.*);
+        acc.* = null;
+        return;
+    }
+    const next = PyUnicode_Concat(acc.*, piece);
+    Py_DecRef(acc.*);
+    Py_DecRef(piece);
+    acc.* = next;
+}
+
+// ── tp_repr ───────────────────────────────────────────────────────────────────
+
+/// Returns a namespace containing `call`, suitable for use as tp_repr.
+/// Produces "ClassName(field1=repr(val1), field2=repr(val2), ...)".
+pub fn reprFn(comptime T: type, comptime class_name: [:0]const u8) type {
+    comptime assertObBase(T);
+    const DataType = getDataType(T);
+    return struct {
+        pub fn call(self_obj: ?*PyObject) callconv(.c) ?*PyObject {
+            const self: *const T = @ptrCast(@alignCast(self_obj.?));
+            var result: ?*PyObject = PyUnicode_FromStringAndSize(class_name.ptr, @intCast(class_name.len));
+            appendConcat(&result, PyUnicode_FromStringAndSize("(", 1));
+            inline for (@typeInfo(DataType).@"struct".fields, 0..) |field, i| {
+                if (i > 0) appendConcat(&result, PyUnicode_FromStringAndSize(", ", 2));
+                appendConcat(&result, PyUnicode_FromStringAndSize(field.name.ptr, @intCast(field.name.len)));
+                appendConcat(&result, PyUnicode_FromStringAndSize("=", 1));
+                const val_repr: ?*PyObject = blk: {
+                    const val_obj: ?*PyObject = switch (field.type) {
+                        i64 => PyLong_FromLongLong(@as(c_longlong, @intCast(@field(self.data, field.name)))),
+                        f64 => PyFloat_FromDouble(@field(self.data, field.name)),
+                        [:0]const u8 => PyUnicode_FromStringAndSize(
+                            @field(self.data, field.name).ptr,
+                            @intCast(@field(self.data, field.name).len),
+                        ),
+                        else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                    };
+                    if (val_obj) |vo| {
+                        defer Py_DecRef(vo);
+                        break :blk PyObject_Repr(vo);
+                    }
+                    break :blk null;
+                };
+                if (val_repr == null) {
+                    if (result) |r| Py_DecRef(r);
+                    return null;
+                }
+                appendConcat(&result, val_repr);
+            }
+            appendConcat(&result, PyUnicode_FromStringAndSize(")", 1));
+            return result;
+        }
+    };
+}
+
 // ── tp_dealloc ────────────────────────────────────────────────────────────────
 
 /// Returns a namespace containing `call` for tp_dealloc.
@@ -611,6 +677,8 @@ pub fn frozenSetAttrFn() type {
 pub const makeTypeOptions = struct {
     /// Wire tp_init; set false when init=False is passed to @zetaclass.
     init: bool = true,
+    /// Wire tp_repr; set false when repr=False is passed to @zetaclass.
+    repr: bool = true,
     /// Wire tp_richcompare for eq/ne; set false when eq=False is passed to @zetaclass.
     eq: bool = true,
     /// Wire tp_richcompare for lt/le/gt/ge; requires eq=true.
@@ -650,7 +718,7 @@ pub fn makeTypeObject(
         .tp_getattr = null,
         .tp_setattr = null,
         .tp_as_async = null,
-        .tp_repr = null,
+        .tp_repr = if (opts.repr) @ptrCast(@constCast(&reprFn(T, name).call)) else null,
         .tp_as_number = null,
         .tp_as_sequence = null,
         .tp_as_mapping = null,

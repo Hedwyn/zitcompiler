@@ -52,8 +52,8 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     unsafe_hash = kwargs.pop("unsafe_hash", False)
     kw_only = kwargs.pop("kw_only", False)
     weakref_slot = kwargs.pop("weakref_slot", False)
-    kwargs.pop("repr", True)  # TODO: not yet implemented
-    kwargs.pop("match_args", True)  # TODO: not yet implemented
+    repr_opt = kwargs.pop("repr", True)
+    match_args = kwargs.pop("match_args", True)
     if "slots" in kwargs:
         if not kwargs.pop("slots"):
             warnings.warn(
@@ -104,7 +104,8 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             "",
             f"pub export var {class_name}Type: core.PyTypeObject = "
             f'core.makeTypeObject({class_name}Object, "{class_name}", '
-            f".{{ .init = {_make_boolean(init)}, .eq = {_make_boolean(eq)}, .order = {_make_boolean(order)}, "
+            f".{{ .init = {_make_boolean(init)}, .repr = {_make_boolean(repr_opt)}, "
+            f".eq = {_make_boolean(eq)}, .order = {_make_boolean(order)}, "
             f".hash = {_make_boolean(hash_opt)}, .frozen = {_make_boolean(frozen)}, "
             f".kw_only = {_make_boolean(kw_only)}, .weakref_slot = {_make_boolean(weakref_slot)} }});",
         ]
@@ -136,7 +137,15 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     cls.__annotations__ = {n: t for n, t in field_pairs}
     dataclasses.dataclass(cls, init=False, eq=False, repr=False)
     dc_fields: dict[str, object] = cls.__dataclass_fields__
-    return type(class_name, (native_type,), {"__dataclass_fields__": dc_fields})
+    match_args_tuple = tuple(field_names) if match_args else ()
+    return type(
+        class_name,
+        (native_type,),
+        {
+            "__dataclass_fields__": dc_fields,
+            "__match_args__": match_args_tuple,
+        },
+    )
 
 
 def zetaclass(

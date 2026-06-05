@@ -391,3 +391,88 @@ def test_slots_true_no_warning() -> None:
             x: int = 0
 
     assert len(caught) == 0
+
+
+# ── repr=True ─────────────────────────────────────────────────────────────────
+
+
+@dataclass()
+class ReprDatacls:
+    name: str = "John"
+    age: int = 35
+    height: float = 1.77
+
+
+@zetaclass
+class ReprZetacls:
+    name: str = "John"
+    age: int = 35
+    height: float = 1.77
+
+
+def _fields_repr(r: str) -> str:
+    """Return the '(field=val, ...)' suffix of a dataclass repr."""
+    return r[r.index("(") :]
+
+
+def test_repr_default_instances() -> None:
+    assert _fields_repr(repr(ReprDatacls())) == _fields_repr(repr(ReprZetacls()))
+
+
+def test_repr_custom_values() -> None:
+    assert _fields_repr(repr(ReprDatacls("Alice", 30, 1.65))) == _fields_repr(
+        repr(ReprZetacls("Alice", 30, 1.65))
+    )
+
+
+def test_repr_string_escaping() -> None:
+    # Quotes and special chars in string fields must be properly escaped
+    assert _fields_repr(repr(ReprDatacls("O'Brien", 40, 1.70))) == _fields_repr(
+        repr(ReprZetacls("O'Brien", 40, 1.70))
+    )
+
+
+def test_repr_false_falls_back_to_object_repr() -> None:
+    @dataclass(repr=False)
+    class _NoReprDc:
+        x: int = 0
+
+    @zetaclass(repr=False)
+    class _NoReprZc:
+        x: int = 0
+
+    # Both should use object's default repr (address-based), not a field repr
+    assert not repr(_NoReprDc()).startswith("_NoReprDc(")
+    assert not repr(_NoReprZc()).startswith("_NoReprZc(")
+
+
+# ── match_args ────────────────────────────────────────────────────────────────
+
+
+@zetaclass
+class MatchTarget:
+    x: int = 0
+    y: int = 0
+    label: str = ""
+
+
+def test_match_args_default_contains_all_fields() -> None:
+    assert MatchTarget.__match_args__ == ("x", "y", "label")
+
+
+def test_match_args_false_is_empty() -> None:
+    @zetaclass(match_args=False)
+    class _NoMatchArgs:
+        x: int = 0
+
+    assert _NoMatchArgs.__match_args__ == ()
+
+
+def test_match_args_structural_pattern_matching() -> None:
+    obj = MatchTarget(1, 2, "hi")
+    match obj:
+        case MatchTarget(x=1, label=lbl):
+            result = lbl
+        case _:
+            result = "no match"
+    assert result == "hi"
