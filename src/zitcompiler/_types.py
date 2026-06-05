@@ -20,7 +20,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator, Mapping
 
     from _typeshed import DataclassInstance
 
@@ -188,6 +188,43 @@ def get_zig_type(
     return builtin_type
 
 
+def generate_zig_struct(
+    struct_name: str,
+    field_pairs: Iterable[tuple[str, TypeHint]],
+    defaults: Mapping[str, object] | None = None,
+    custom_type_map: dict[type, str] | None = None,
+) -> list[str]:
+    """Generate Zig struct lines from a name, field pairs, and optional defaults.
+
+    Uses inline field syntax for i64/f64 defaults and ``pub const fname_default``
+    for ``[]const u8`` defaults, matching what core.zig's comptime machinery expects.
+    """
+    _defaults = defaults or {}
+    _field_pairs = list(field_pairs)
+    lines = [f"pub const {struct_name} = struct {{"]
+    for fname, ftype in _field_pairs:
+        zig_type = get_zig_type(ftype, custom_type_map)
+        base = _base_type(ftype)
+        if fname in _defaults and base is not str:
+            val = _defaults[fname]
+            if base is int:
+                assert isinstance(val, int)
+                zig_val = str(val)
+            elif base is float:
+                assert isinstance(val, (int, float))
+                zig_val = repr(float(val))
+            else:
+                raise UnsupportedType(f"no inline default formatter for {base!r}")
+            lines.append(f"    {fname}: {zig_type} = {zig_val},")
+        else:
+            lines.append(f"    {fname}: {zig_type},")
+    for fname, ftype in _field_pairs:
+        if fname in _defaults and _base_type(ftype) is str:
+            lines.append(_zig_default_decl(fname, ftype, _defaults[fname]))
+    lines.append("};")
+    return lines
+
+
 def generate_zig_code(
     constants: type[DataclassInstance],
     target_type: GenerationTarget = "module",
@@ -213,15 +250,9 @@ def generate_zig_code(
             for f in fields(constants)
         ]
     elif target_type == "struct":
-        lines = [f"pub const {class_name} = struct {{"]
-        for f in fields(constants):
-            zig_type = get_zig_type(type_hints[f.name], custom_type_map)
-            lines.append(f"    {f.name}: {zig_type},")
-        for f in fields(constants):
-            if f.default is not MISSING:
-                lines.append(_zig_default_decl(f.name, type_hints[f.name], f.default))
-        lines.append("};")
-        return lines
+        field_pairs = [(f.name, type_hints[f.name]) for f in fields(constants)]
+        defaults = {f.name: f.default for f in fields(constants) if f.default is not MISSING}
+        return generate_zig_struct(class_name, field_pairs, defaults, custom_type_map)
     else:
         raise ValueError(f"Unknown target_type: {target_type}")
 

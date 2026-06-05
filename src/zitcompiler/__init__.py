@@ -15,12 +15,14 @@ from typing import TYPE_CHECKING, Literal, assert_never, overload
 from ._compiler import BuildLibOptions, zig_build_lib
 from ._loader import load_class, load_function
 from ._types import (
+    ZIG_TYPE_MAP,
     Annotation,
     UnsupportedType,
     ZigModuleDef,
     ZigType,
     generate_zig_code,
     generate_zig_module_code,
+    generate_zig_struct,
     get_annotation,
     get_annotations,
     get_zig_type,
@@ -139,10 +141,12 @@ __all__ = [
     "Annotation",
     "BuildLibOptions",
     "UnsupportedType",
+    "ZIG_TYPE_MAP",
     "ZigModuleDef",
     "ZigType",
     "generate_zig_code",
     "generate_zig_module_code",
+    "generate_zig_struct",
     "get_annotation",
     "get_annotations",
     "get_zig_type",

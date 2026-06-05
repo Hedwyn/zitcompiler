@@ -15,8 +15,13 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, Unpack, get_type_hints
 
-from zitcompiler import BuildLibOptions, load_class, zig_build_lib
-from zitcompiler._types import ZIG_TYPE_MAP, _zig_default_decl, get_zig_type
+from zitcompiler import (
+    ZIG_TYPE_MAP,
+    BuildLibOptions,
+    generate_zig_struct,
+    load_class,
+    zig_build_lib,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,52 +41,6 @@ class DataclassKwargs(TypedDict, total=False):
 
 
 _CORE_ZIG = Path(__file__).parent / "core.zig"
-
-
-def _generate_params_zig(
-    class_name: str,
-    field_pairs: list[tuple[str, type]],
-    defaults: dict[str, object],
-    *,
-    init: bool = True,
-    eq: bool = True,
-) -> str:
-    lines = ['const core = @import("core");', ""]
-
-    data_type = f"{class_name}Data"
-    lines.append(f"const {data_type} = struct {{")
-    for fname, ftype in field_pairs:
-        zig_type = get_zig_type(ftype)
-        if fname in defaults and ftype is not str:
-            val = defaults[fname]
-            if ftype is int:
-                assert isinstance(val, int)
-                zig_val = str(val)
-            elif ftype is float:
-                assert isinstance(val, (int, float))
-                zig_val = repr(float(val))
-            else:
-                raise TypeError(f"zetaclass: inline defaults not supported for {ftype!r}")
-            lines.append(f"    {fname}: {zig_type} = {zig_val},")
-        else:
-            lines.append(f"    {fname}: {zig_type},")
-    for fname, ftype in field_pairs:
-        if fname in defaults and ftype is str:
-            lines.append(_zig_default_decl(fname, ftype, defaults[fname]))
-    lines.append("};")
-    lines.append("")
-
-    lines.append(f"pub const {class_name}Object = core.wrapAsPythonObject({data_type});")
-    lines.append("")
-
-    zig_init = str(init).lower()
-    zig_eq = str(eq).lower()
-    lines.append(
-        f"pub export var {class_name}Type: core.PyTypeObject = "
-        f'core.makeTypeObject({class_name}Object, "{class_name}", '
-        f".{{ .init = {zig_init}, .eq = {zig_eq} }});",
-    )
-    return "\n".join(lines)
 
 
 def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
@@ -109,7 +68,22 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
                 break
 
     class_name = cls.__name__
-    params_src = _generate_params_zig(class_name, field_pairs, defaults, init=init, eq=eq)
+    data_type = f"{class_name}Data"
+    zig_init = str(init).lower()
+    zig_eq = str(eq).lower()
+    params_src = "\n".join(
+        [
+            'const core = @import("core");',
+            "",
+            *generate_zig_struct(data_type, field_pairs, defaults),
+            "",
+            f"pub const {class_name}Object = core.wrapAsPythonObject({data_type});",
+            "",
+            f"pub export var {class_name}Type: core.PyTypeObject = "
+            f'core.makeTypeObject({class_name}Object, "{class_name}", '
+            f".{{ .init = {zig_init}, .eq = {zig_eq} }});",
+        ]
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         params_path = Path(tmp) / "params.zig"
@@ -136,7 +110,7 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
 
     cls.__annotations__ = {n: t for n, t in field_pairs}
     dataclasses.dataclass(cls, init=False, eq=False, repr=False)
-    dc_fields: dict[str, object] = getattr(cls, "__dataclass_fields__")
+    dc_fields: dict[str, object] = cls.__dataclass_fields__
     return type(class_name, (native_type,), {"__dataclass_fields__": dc_fields})
 
 
