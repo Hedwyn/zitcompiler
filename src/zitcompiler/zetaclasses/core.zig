@@ -5,10 +5,9 @@
 //!   const core = @import("core");
 //!
 //!   const PersonData = struct {
-//!       name: []const u8,
+//!       name: [:0]const u8 = "John",
 //!       age: i64 = 35,
 //!       height: f64 = 1.77,
-//!       pub const name_default: [:0]const u8 = "John";
 //!   };
 //!
 //!   pub const PersonObject = core.wrapAsPythonObject(PersonData);
@@ -16,9 +15,9 @@
 //!   pub export var PersonType: core.PyTypeObject =
 //!       core.makeTypeObject(PersonObject, "Person", .{});
 //!
-//! i64/f64 defaults use Zig inline field syntax. []const u8 defaults use a
-//! `pub const fname_default: [:0]const u8` declaration; the bytes are copied
-//! to heap memory owned by the struct instance.
+//! All defaults use Zig inline field syntax. [:0]const u8 string defaults are
+//! heap-copied on init to maintain the ownership invariant (every non-empty
+//! string field is heap-allocated and owned by the struct instance).
 //! Fields with no default simply omit the declaration; missing arguments at
 //! init time will raise TypeError.
 //! @date: 04.06.2026
@@ -202,18 +201,18 @@ fn memberTypeCode(comptime FieldType: type) c_int {
 fn hasStringFields(comptime T: type) bool {
     const DataType = getDataType(T);
     inline for (@typeInfo(DataType).@"struct".fields) |field| {
-        if (field.type == []const u8) return true;
+        if (field.type == [:0]const u8) return true;
     }
     return false;
 }
 
 // Store a Python arg into a struct field.
-// For []const u8: extracts UTF-8 bytes, frees the previous allocation, copies to new heap buffer.
+// For [:0]const u8: extracts UTF-8 bytes, frees the previous allocation, copies to new heap buffer.
 fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void {
     switch (FieldType) {
         i64 => dest.* = @as(i64, @intCast(PyLong_AsLongLong(arg))),
         f64 => dest.* = PyFloat_AsDouble(arg),
-        []const u8 => {
+        [:0]const u8 => {
             var size: Py_ssize_t = 0;
             const ptr = PyUnicode_AsUTF8AndSize(arg, &size) orelse return;
             const n: usize = @intCast(size);
@@ -223,12 +222,13 @@ fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void 
                 dest.* = "";
                 return;
             }
-            const buf: [*]u8 = @ptrCast(PyMem_Malloc(n) orelse {
+            const buf: [*]u8 = @ptrCast(PyMem_Malloc(n + 1) orelse {
                 PyErr_SetString(PyExc_MemoryError, "zetaclass: out of memory for string field");
                 return;
             });
             @memcpy(buf[0..n], ptr[0..n]);
-            dest.* = buf[0..n];
+            buf[n] = 0;
+            dest.* = buf[0..n :0];
         },
         else => @compileError("unsupported zetaclass field type: " ++ @typeName(FieldType)),
     }
@@ -237,7 +237,7 @@ fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void 
 // ── tp_members array ──────────────────────────────────────────────────────────
 
 /// Returns a namespace with a static `array: [N+1]PyMemberDef` for numeric fields.
-/// []const u8 (string) fields are excluded — they are exposed via tp_getset instead.
+/// [:0]const u8 (string) fields are excluded — they are exposed via tp_getset instead.
 pub fn membersArray(comptime T: type) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
@@ -246,13 +246,13 @@ pub fn membersArray(comptime T: type) type {
 
     comptime var N: usize = 0;
     inline for (data_fields) |field| {
-        if (field.type != []const u8) N += 1;
+        if (field.type != [:0]const u8) N += 1;
     }
 
     comptime var init_array: [N + 1]PyMemberDef = std.mem.zeroes([N + 1]PyMemberDef);
     comptime var idx: usize = 0;
     inline for (data_fields) |field| {
-        if (field.type != []const u8) {
+        if (field.type != [:0]const u8) {
             init_array[idx] = .{
                 .name = @ptrCast(field.name.ptr),
                 .member_type = memberTypeCode(field.type),
@@ -271,7 +271,7 @@ pub fn membersArray(comptime T: type) type {
 
 // ── tp_getset array ───────────────────────────────────────────────────────────
 
-/// Returns a namespace with a static `array: [N+1]PyGetSetDef` for []const u8 fields.
+/// Returns a namespace with a static `array: [N+1]PyGetSetDef` for [:0]const u8 fields.
 /// The getter returns a new Python str from the stored bytes.
 /// The setter extracts UTF-8 bytes, frees the old buffer, copies the new bytes.
 pub fn getsetArray(comptime T: type) type {
@@ -281,13 +281,13 @@ pub fn getsetArray(comptime T: type) type {
 
     comptime var N: usize = 0;
     inline for (data_fields) |field| {
-        if (field.type == []const u8) N += 1;
+        if (field.type == [:0]const u8) N += 1;
     }
 
     comptime var init_array: [N + 1]PyGetSetDef = std.mem.zeroes([N + 1]PyGetSetDef);
     comptime var idx: usize = 0;
     inline for (data_fields) |field| {
-        if (field.type == []const u8) {
+        if (field.type == [:0]const u8) {
             const FieldAccessor = struct {
                 fn get(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
                     const self: *T = @ptrCast(@alignCast(self_obj.?));
@@ -305,12 +305,13 @@ pub fn getsetArray(comptime T: type) type {
                         @field(self.data, field.name) = "";
                         return 0;
                     }
-                    const buf: [*]u8 = @ptrCast(PyMem_Malloc(n) orelse {
+                    const buf: [*]u8 = @ptrCast(PyMem_Malloc(n + 1) orelse {
                         PyErr_SetString(PyExc_MemoryError, "zetaclass: out of memory for string setter");
                         return -1;
                     });
                     @memcpy(buf[0..n], ptr[0..n]);
-                    @field(self.data, field.name) = buf[0..n];
+                    buf[n] = 0;
+                    @field(self.data, field.name) = buf[0..n :0];
                     return 0;
                 }
             };
@@ -335,9 +336,8 @@ pub fn getsetArray(comptime T: type) type {
 /// Returns a namespace containing `call`, suitable for use as tp_init.
 ///
 /// Fields are populated in declaration order from positional args, then keyword
-/// args by field name, then defaults:
-///   - []const u8 fields: `pub const fname_default: [:0]const u8` declaration
-///   - i64/f64 fields: inline struct field default via field.defaultValue()
+/// args by field name, then inline struct field defaults via field.defaultValue().
+/// [:0]const u8 defaults are heap-copied to maintain the ownership invariant.
 pub fn initFn(comptime T: type) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
@@ -360,23 +360,25 @@ pub fn initFn(comptime T: type) type {
                 if (arg != null) {
                     storeField(field.type, &@field(self.data, field.name), arg);
                     if (PyErr_Occurred() != null) return -1;
-                } else if (field.type == []const u8 and @hasDecl(DataType, field.name ++ "_default")) {
-                    const dval: [:0]const u8 = @field(DataType, field.name ++ "_default");
-                    const n = dval.len;
-                    const old = @field(self.data, field.name);
-                    if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
-                    if (n == 0) {
-                        @field(self.data, field.name) = "";
-                    } else {
-                        const buf: [*]u8 = @ptrCast(PyMem_Malloc(n) orelse {
-                            PyErr_SetString(PyExc_MemoryError, "zetaclass __init__: out of memory for string default");
-                            return -1;
-                        });
-                        @memcpy(buf[0..n], dval[0..n]);
-                        @field(self.data, field.name) = buf[0..n];
-                    }
                 } else if (field.defaultValue()) |dv| {
-                    @field(self.data, field.name) = dv;
+                    if (field.type == [:0]const u8) {
+                        const n = dv.len;
+                        const old = @field(self.data, field.name);
+                        if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
+                        if (n == 0) {
+                            @field(self.data, field.name) = "";
+                        } else {
+                            const buf: [*]u8 = @ptrCast(PyMem_Malloc(n + 1) orelse {
+                                PyErr_SetString(PyExc_MemoryError, "zetaclass __init__: out of memory for string default");
+                                return -1;
+                            });
+                            @memcpy(buf[0..n], dv[0..n]);
+                            buf[n] = 0;
+                            @field(self.data, field.name) = buf[0..n :0];
+                        }
+                    } else {
+                        @field(self.data, field.name) = dv;
+                    }
                 } else {
                     PyErr_SetString(PyExc_TypeError, "zetaclass __init__: missing required argument");
                     return -1;
@@ -448,7 +450,7 @@ pub fn richCompareFn(comptime T: type) type {
                     i64, f64 => {
                         if (@field(a.data, field.name) != @field(b.data, field.name)) equal = false;
                     },
-                    []const u8 => {
+                    [:0]const u8 => {
                         if (!std.mem.eql(u8, @field(a.data, field.name), @field(b.data, field.name))) equal = false;
                     },
                     else => @compileError("unsupported field type: " ++ @typeName(field.type)),
@@ -465,7 +467,7 @@ pub fn richCompareFn(comptime T: type) type {
 // ── tp_dealloc ────────────────────────────────────────────────────────────────
 
 /// Returns a namespace containing `call` for tp_dealloc.
-/// Frees heap-allocated []const u8 fields, then frees the object memory.
+/// Frees heap-allocated [:0]const u8 fields, then frees the object memory.
 /// Only used for types that have string fields; otherwise tp_dealloc is left null
 /// and PyType_Ready inherits the default from object.
 ///
@@ -495,7 +497,7 @@ pub fn deallocFn(comptime T: type) type {
             }
 
             inline for (@typeInfo(DataType).@"struct".fields) |field| {
-                if (field.type == []const u8) {
+                if (field.type == [:0]const u8) {
                     const s = @field(self.data, field.name);
                     if (s.len > 0) PyMem_Free(@ptrCast(@constCast(s.ptr)));
                 }
@@ -537,7 +539,7 @@ pub const makeTypeOptions = struct {
 ///   struct { ob_base: PyObject, data: SomeDataStruct }
 /// Assign to an `export var` in generated params.zig, then load via load_class().
 ///
-/// String ([]const u8) defaults are declared as `pub const fname_default: [:0]const u8`.
+/// All defaults use Zig inline field syntax; [:0]const u8 defaults are heap-copied on init.
 /// Numeric defaults use Zig inline field syntax.
 /// opts: makeTypeOptions controlling which slots are generated.
 pub fn makeTypeObject(

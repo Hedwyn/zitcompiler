@@ -37,7 +37,7 @@ class UnsupportedType(Exception): ...
 ZIG_TYPE_MAP: dict[type, str] = {
     int: "i64",
     float: "f64",
-    str: "[]const u8",
+    str: "[:0]const u8",
     bytes: "[]const u8",
 }
 
@@ -133,13 +133,6 @@ def get_annotation[T: Annotation](type_hint: TypeHint, annotation_type: type[T])
     return annotations[0]
 
 
-_ZIG_DEFAULT_TYPE_MAP: dict[type, str] = {
-    int: "i64",
-    float: "f64",
-    str: "[:0]const u8",
-}
-
-
 def _base_type(type_hint: TypeHint) -> type:
     if get_origin(type_hint) is Annotated:
         first = get_args(type_hint)[0]
@@ -147,26 +140,6 @@ def _base_type(type_hint: TypeHint) -> type:
         return first
     assert isinstance(type_hint, type), f"expected a type, got {type_hint!r}"
     return type_hint
-
-
-def _zig_default_decl(fname: str, type_hint: TypeHint, value: object) -> str:
-    base = _base_type(type_hint)
-    zig_type = _ZIG_DEFAULT_TYPE_MAP.get(base)
-    if zig_type is None:
-        raise UnsupportedType(f"no default formatter for {base!r}")
-    if base is int:
-        assert isinstance(value, int)
-        zig_val = str(value)
-    elif base is float:
-        assert isinstance(value, (int, float))
-        zig_val = repr(float(value))
-    elif base is str:
-        assert isinstance(value, str)
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        zig_val = f'"{escaped}"'
-    else:
-        raise UnsupportedType(f"no default formatter for {base!r}")
-    return f"    pub const {fname}_default: {zig_type} = {zig_val};"
 
 
 def get_zig_type(
@@ -196,8 +169,8 @@ def generate_zig_struct(
 ) -> list[str]:
     """Generate Zig struct lines from a name, field pairs, and optional defaults.
 
-    Uses inline field syntax for i64/f64 defaults and ``pub const fname_default``
-    for ``[]const u8`` defaults, matching what core.zig's comptime machinery expects.
+    All defaults use inline field syntax. str defaults produce ``[:0]const u8``
+    string literals; i64/f64 defaults produce numeric literals.
     """
     _defaults = defaults or {}
     _field_pairs = list(field_pairs)
@@ -205,7 +178,7 @@ def generate_zig_struct(
     for fname, ftype in _field_pairs:
         zig_type = get_zig_type(ftype, custom_type_map)
         base = _base_type(ftype)
-        if fname in _defaults and base is not str:
+        if fname in _defaults:
             val = _defaults[fname]
             if base is int:
                 assert isinstance(val, int)
@@ -213,14 +186,15 @@ def generate_zig_struct(
             elif base is float:
                 assert isinstance(val, (int, float))
                 zig_val = repr(float(val))
+            elif base is str:
+                assert isinstance(val, str)
+                escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+                zig_val = f'"{escaped}"'
             else:
                 raise UnsupportedType(f"no inline default formatter for {base!r}")
             lines.append(f"    {fname}: {zig_type} = {zig_val},")
         else:
             lines.append(f"    {fname}: {zig_type},")
-    for fname, ftype in _field_pairs:
-        if fname in _defaults and _base_type(ftype) is str:
-            lines.append(_zig_default_decl(fname, ftype, _defaults[fname]))
     lines.append("};")
     return lines
 
