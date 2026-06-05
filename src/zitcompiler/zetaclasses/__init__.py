@@ -46,10 +46,23 @@ _CORE_ZIG = Path(__file__).parent / "core.zig"
 def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     init = kwargs.pop("init", True)
     eq = kwargs.pop("eq", True)
+    order = kwargs.pop("order", False)
+    frozen = kwargs.pop("frozen", False)
+    unsafe_hash = kwargs.pop("unsafe_hash", False)
+    kwargs.pop("repr", True)  # TODO: not yet implemented
+    kwargs.pop("match_args", True)  # TODO: not yet implemented
+    kwargs.pop("kw_only", False)  # TODO: not yet implemented
+    kwargs.pop("slots", False)  # no-op: native struct is always slotted
+    kwargs.pop("weakref_slot", False)  # TODO: not yet implemented
     if kwargs:
         raise NotImplementedError(
             f"zetaclass: keyword arguments not yet supported: {', '.join(sorted(kwargs))}",
         )
+    if order and not eq:
+        raise TypeError("zetaclass: order=True requires eq=True")
+    hash_opt = frozen or unsafe_hash
+    if hash_opt and not eq:
+        raise TypeError("zetaclass: cannot use hash with eq=False")
 
     hints = get_type_hints(cls)
     field_names = list(hints.keys())
@@ -69,8 +82,10 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
 
     class_name = cls.__name__
     data_type = f"{class_name}Data"
-    zig_init = str(init).lower()
-    zig_eq = str(eq).lower()
+
+    def _make_boolean(v: bool) -> str:
+        return str(v).lower()
+
     params_src = "\n".join(
         [
             'const core = @import("core");',
@@ -81,7 +96,8 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             "",
             f"pub export var {class_name}Type: core.PyTypeObject = "
             f'core.makeTypeObject({class_name}Object, "{class_name}", '
-            f".{{ .init = {zig_init}, .eq = {zig_eq} }});",
+            f".{{ .init = {_make_boolean(init)}, .eq = {_make_boolean(eq)}, .order = {_make_boolean(order)}, "
+            f".hash = {_make_boolean(hash_opt)}, .frozen = {_make_boolean(frozen)} }});",
         ]
     )
 

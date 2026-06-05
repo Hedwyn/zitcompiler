@@ -135,7 +135,12 @@ extern fn PyDict_Size(dict: ?*PyObject) Py_ssize_t;
 extern fn PyErr_SetString(exc: ?*PyObject, msg: [*:0]const u8) void;
 extern fn PyErr_Occurred() ?*PyObject;
 extern fn PyObject_RichCompareBool(a: ?*PyObject, b: ?*PyObject, op: c_int) c_int;
+extern fn PyObject_Hash(obj: ?*PyObject) Py_ssize_t;
 extern fn PyObject_Free(ptr: ?*anyopaque) void;
+extern fn PyTuple_New(size: Py_ssize_t) ?*PyObject;
+extern fn PyTuple_SetItem(tup: ?*PyObject, i: Py_ssize_t, item: ?*PyObject) c_int;
+extern fn PyLong_FromLongLong(v: c_longlong) ?*PyObject;
+extern fn PyFloat_FromDouble(v: f64) ?*PyObject;
 extern fn PyObject_GC_UnTrack(op: ?*anyopaque) void;
 extern fn PyObject_ClearManagedDict(op: ?*PyObject) void;
 extern fn PyObject_ClearWeakRefs(op: ?*PyObject) void;
@@ -144,13 +149,18 @@ extern fn PyUnicode_FromStringAndSize(u: ?[*]const u8, size: Py_ssize_t) ?*PyObj
 extern fn PyMem_Malloc(n: usize) ?*anyopaque;
 extern fn PyMem_Free(p: ?*anyopaque) void;
 extern var PyExc_TypeError: *PyObject;
+extern var PyExc_AttributeError: *PyObject;
 extern var PyExc_MemoryError: *PyObject;
 extern var _Py_TrueStruct: PyObject;
 extern var _Py_FalseStruct: PyObject;
 extern var _Py_NotImplementedStruct: PyObject;
 
+const Py_LT: c_int = 0;
+const Py_LE: c_int = 1;
 const Py_EQ: c_int = 2;
 const Py_NE: c_int = 3;
+const Py_GT: c_int = 4;
+const Py_GE: c_int = 5;
 const Py_TPFLAGS_BASETYPE: c_ulong = 1 << 10;
 const Py_TPFLAGS_MANAGED_WEAKREF: c_ulong = 1 << 3;
 const Py_TPFLAGS_MANAGED_DICT: c_ulong = 1 << 4;
@@ -274,7 +284,8 @@ pub fn membersArray(comptime T: type) type {
 /// Returns a namespace with a static `array: [N+1]PyGetSetDef` for [:0]const u8 fields.
 /// The getter returns a new Python str from the stored bytes.
 /// The setter extracts UTF-8 bytes, frees the old buffer, copies the new bytes.
-pub fn getsetArray(comptime T: type) type {
+/// When frozen=true the set pointer is null (making the field read-only at the descriptor level).
+pub fn getsetArray(comptime T: type, comptime frozen: bool) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
     const data_fields = @typeInfo(DataType).@"struct".fields;
@@ -317,8 +328,8 @@ pub fn getsetArray(comptime T: type) type {
             };
             init_array[idx] = .{
                 .name = @ptrCast(field.name.ptr),
-                .get = @constCast(@ptrCast(&FieldAccessor.get)),
-                .set = @constCast(@ptrCast(&FieldAccessor.set)),
+                .get = @ptrCast(@constCast(&FieldAccessor.get)),
+                .set = if (frozen) null else @ptrCast(@constCast(&FieldAccessor.set)),
                 .doc = null,
                 .closure = null,
             };
@@ -415,13 +426,39 @@ pub fn noInitFn() type {
 
 // ── tp_richcompare ────────────────────────────────────────────────────────────
 
+/// Lexicographic ordering result over fields: .lt, .eq, or .gt.
+const FieldOrder = enum { lt, eq, gt };
+
+fn compareFields(comptime T: type, a: *const T, b: *const T) FieldOrder {
+    const DataType = getDataType(T);
+    inline for (@typeInfo(DataType).@"struct".fields) |field| {
+        switch (field.type) {
+            i64, f64 => {
+                const av = @field(a.data, field.name);
+                const bv = @field(b.data, field.name);
+                if (av < bv) return .lt;
+                if (av > bv) return .gt;
+            },
+            [:0]const u8 => {
+                const ord = std.mem.order(u8, @field(a.data, field.name), @field(b.data, field.name));
+                switch (ord) {
+                    .lt => return .lt,
+                    .gt => return .gt,
+                    .eq => {},
+                }
+            },
+            else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+        }
+    }
+    return .eq;
+}
+
 /// Returns a namespace containing `call`, suitable for use as tp_richcompare.
 ///
-/// Handles Py_EQ and Py_NE via field-by-field comparison.
-/// Returns Py_NotImplemented for other ops or when operand types differ.
-pub fn richCompareFn(comptime T: type) type {
+/// When order=false only Py_EQ/Py_NE are handled; other ops return NotImplemented.
+/// When order=true all six comparison ops are handled via lexicographic field comparison.
+pub fn richCompareFn(comptime T: type, comptime order: bool) type {
     comptime assertObBase(T);
-    const DataType = getDataType(T);
     return struct {
         pub fn call(
             a_obj: ?*PyObject,
@@ -438,25 +475,25 @@ pub fn richCompareFn(comptime T: type) type {
                 Py_IncRef(&_Py_NotImplementedStruct);
                 return &_Py_NotImplementedStruct;
             }
-            if (op != Py_EQ and op != Py_NE) {
+            if (!order and op != Py_EQ and op != Py_NE) {
                 Py_IncRef(&_Py_NotImplementedStruct);
                 return &_Py_NotImplementedStruct;
             }
             const a: *const T = @ptrCast(@alignCast(a_obj));
             const b: *const T = @ptrCast(@alignCast(b_obj));
-            var equal = true;
-            inline for (@typeInfo(DataType).@"struct".fields) |field| {
-                switch (field.type) {
-                    i64, f64 => {
-                        if (@field(a.data, field.name) != @field(b.data, field.name)) equal = false;
-                    },
-                    [:0]const u8 => {
-                        if (!std.mem.eql(u8, @field(a.data, field.name), @field(b.data, field.name))) equal = false;
-                    },
-                    else => @compileError("unsupported field type: " ++ @typeName(field.type)),
-                }
-            }
-            const result = if (op == Py_EQ) equal else !equal;
+            const ord = compareFields(T, a, b);
+            const result = switch (op) {
+                Py_EQ => ord == .eq,
+                Py_NE => ord != .eq,
+                Py_LT => ord == .lt,
+                Py_LE => ord == .lt or ord == .eq,
+                Py_GT => ord == .gt,
+                Py_GE => ord == .gt or ord == .eq,
+                else => {
+                    Py_IncRef(&_Py_NotImplementedStruct);
+                    return &_Py_NotImplementedStruct;
+                },
+            };
             const ret: *PyObject = if (result) &_Py_TrueStruct else &_Py_FalseStruct;
             Py_IncRef(ret);
             return ret;
@@ -524,6 +561,57 @@ pub fn deallocFn(comptime T: type) type {
 extern fn Py_IncRef(obj: ?*PyObject) void;
 extern fn Py_DecRef(obj: ?*PyObject) void;
 
+// ── tp_hash ───────────────────────────────────────────────────────────────────
+
+/// Returns a namespace containing `call`, suitable for use as tp_hash.
+/// Builds a Python tuple of all field values and delegates to PyObject_Hash.
+pub fn hashFn(comptime T: type) type {
+    comptime assertObBase(T);
+    const DataType = getDataType(T);
+    const data_fields = @typeInfo(DataType).@"struct".fields;
+    return struct {
+        pub fn call(self_obj: ?*PyObject) callconv(.c) Py_ssize_t {
+            const self: *const T = @ptrCast(@alignCast(self_obj.?));
+            const tup = PyTuple_New(@intCast(data_fields.len)) orelse return -1;
+            inline for (data_fields, 0..) |field, i| {
+                const item: ?*PyObject = switch (field.type) {
+                    i64 => PyLong_FromLongLong(@intCast(@field(self.data, field.name))),
+                    f64 => PyFloat_FromDouble(@field(self.data, field.name)),
+                    [:0]const u8 => blk: {
+                        const s = @field(self.data, field.name);
+                        break :blk PyUnicode_FromStringAndSize(s.ptr, @intCast(s.len));
+                    },
+                    else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                };
+                if (item == null) {
+                    Py_DecRef(tup);
+                    return -1;
+                }
+                // PyTuple_SetItem steals the reference to item.
+                _ = PyTuple_SetItem(tup, @intCast(i), item);
+            }
+            const h = PyObject_Hash(tup);
+            Py_DecRef(tup);
+            return h;
+        }
+    };
+}
+
+// ── tp_setattro (frozen) ──────────────────────────────────────────────────────
+
+/// tp_setattro slot for frozen types: always raises AttributeError.
+pub fn frozenSetAttrFn() type {
+    return struct {
+        pub fn call(self_obj: ?*PyObject, name: ?*PyObject, value: ?*PyObject) callconv(.c) c_int {
+            _ = self_obj;
+            _ = name;
+            _ = value;
+            PyErr_SetString(PyExc_AttributeError, "cannot assign to field of frozen instance");
+            return -1;
+        }
+    };
+}
+
 // ── makeTypeObject ────────────────────────────────────────────────────────────
 
 /// Options controlling which slots are wired into the generated type.
@@ -531,8 +619,14 @@ extern fn Py_DecRef(obj: ?*PyObject) void;
 pub const makeTypeOptions = struct {
     /// Wire tp_init; set false when init=False is passed to @zetaclass.
     init: bool = true,
-    /// Wire tp_richcompare; set false when eq=False is passed to @zetaclass.
+    /// Wire tp_richcompare for eq/ne; set false when eq=False is passed to @zetaclass.
     eq: bool = true,
+    /// Wire tp_richcompare for lt/le/gt/ge; requires eq=true.
+    order: bool = false,
+    /// Wire tp_hash; set when frozen=True or unsafe_hash=True.
+    hash: bool = false,
+    /// Wire tp_setattro to reject mutation; set when frozen=True.
+    frozen: bool = false,
 };
 
 /// Build a PyTypeObject for an Object struct of the form:
@@ -564,23 +658,23 @@ pub fn makeTypeObject(
         .tp_as_number = null,
         .tp_as_sequence = null,
         .tp_as_mapping = null,
-        .tp_hash = null,
+        .tp_hash = if (opts.hash) @ptrCast(@constCast(&hashFn(T).call)) else null,
         .tp_call = null,
         .tp_str = null,
         .tp_getattro = null,
-        .tp_setattro = null,
+        .tp_setattro = if (opts.frozen) @ptrCast(@constCast(&frozenSetAttrFn().call)) else null,
         .tp_as_buffer = null,
         .tp_flags = Py_TPFLAGS_BASETYPE,
         .tp_doc = null,
         .tp_traverse = null,
         .tp_clear = null,
-        .tp_richcompare = if (opts.eq) @ptrCast(@constCast(&richCompareFn(T).call)) else null,
+        .tp_richcompare = if (opts.eq) @ptrCast(@constCast(&richCompareFn(T, opts.order).call)) else null,
         .tp_weaklistoffset = 0,
         .tp_iter = null,
         .tp_iternext = null,
         .tp_methods = null,
         .tp_members = &membersArray(T).array,
-        .tp_getset = if (hasStringFields(T)) &getsetArray(T).array else null,
+        .tp_getset = if (hasStringFields(T)) &getsetArray(T, opts.frozen).array else null,
         .tp_base = null,
         .tp_dict = null,
         .tp_descr_get = null,
