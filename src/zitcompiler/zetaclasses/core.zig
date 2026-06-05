@@ -135,10 +135,7 @@ extern fn PyDict_Size(dict: ?*PyObject) Py_ssize_t;
 extern fn PyErr_SetString(exc: ?*PyObject, msg: [*:0]const u8) void;
 extern fn PyErr_Occurred() ?*PyObject;
 extern fn PyObject_RichCompareBool(a: ?*PyObject, b: ?*PyObject, op: c_int) c_int;
-extern fn PyObject_Hash(obj: ?*PyObject) Py_ssize_t;
 extern fn PyObject_Free(ptr: ?*anyopaque) void;
-extern fn PyTuple_New(size: Py_ssize_t) ?*PyObject;
-extern fn PyTuple_SetItem(tup: ?*PyObject, i: Py_ssize_t, item: ?*PyObject) c_int;
 extern fn PyLong_FromLongLong(v: c_longlong) ?*PyObject;
 extern fn PyFloat_FromDouble(v: f64) ?*PyObject;
 extern fn PyObject_GC_UnTrack(op: ?*anyopaque) void;
@@ -564,35 +561,26 @@ extern fn Py_DecRef(obj: ?*PyObject) void;
 // ── tp_hash ───────────────────────────────────────────────────────────────────
 
 /// Returns a namespace containing `call`, suitable for use as tp_hash.
-/// Builds a Python tuple of all field values and delegates to PyObject_Hash.
+/// Hashes the data struct using Wyhash over all fields' raw bytes / string contents.
+/// -1 is mapped to -2 (Python uses -1 as the error sentinel for tp_hash).
 pub fn hashFn(comptime T: type) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
-    const data_fields = @typeInfo(DataType).@"struct".fields;
     return struct {
         pub fn call(self_obj: ?*PyObject) callconv(.c) Py_ssize_t {
             const self: *const T = @ptrCast(@alignCast(self_obj.?));
-            const tup = PyTuple_New(@intCast(data_fields.len)) orelse return -1;
-            inline for (data_fields, 0..) |field, i| {
-                const item: ?*PyObject = switch (field.type) {
-                    i64 => PyLong_FromLongLong(@intCast(@field(self.data, field.name))),
-                    f64 => PyFloat_FromDouble(@field(self.data, field.name)),
-                    [:0]const u8 => blk: {
-                        const s = @field(self.data, field.name);
-                        break :blk PyUnicode_FromStringAndSize(s.ptr, @intCast(s.len));
-                    },
+            var hasher = std.hash.Wyhash.init(0);
+            inline for (@typeInfo(DataType).@"struct".fields) |field| {
+                switch (field.type) {
+                    i64 => std.hash.autoHash(&hasher, @field(self.data, field.name)),
+                    f64 => std.hash.autoHash(&hasher, @as(u64, @bitCast(@field(self.data, field.name)))),
+                    [:0]const u8 => hasher.update(@field(self.data, field.name)),
                     else => @compileError("unsupported field type: " ++ @typeName(field.type)),
-                };
-                if (item == null) {
-                    Py_DecRef(tup);
-                    return -1;
                 }
-                // PyTuple_SetItem steals the reference to item.
-                _ = PyTuple_SetItem(tup, @intCast(i), item);
             }
-            const h = PyObject_Hash(tup);
-            Py_DecRef(tup);
-            return h;
+            const raw: usize = @truncate(hasher.final());
+            const result: Py_ssize_t = @bitCast(raw);
+            return if (result == -1) -2 else result;
         }
     };
 }

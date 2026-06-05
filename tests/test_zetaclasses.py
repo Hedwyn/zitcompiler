@@ -162,3 +162,146 @@ def test_no_eq_uses_identity() -> None:
     # Same instance equals itself
     assert d1 == d1
     assert z1 == z1
+
+
+# ── order=True ────────────────────────────────────────────────────────────────
+
+
+@dataclass(order=True)
+class RankedDatacls:
+    tier: int = 0
+    name: str = ""
+
+
+@zetaclass(order=True)
+class RankedZetacls:
+    tier: int = 0
+    name: str = ""
+
+
+def test_order_lt_by_first_field() -> None:
+    for cls in (RankedDatacls, RankedZetacls):
+        assert cls(1, "b") < cls(2, "a")
+
+
+def test_order_lt_by_second_field_when_first_equal() -> None:
+    for cls in (RankedDatacls, RankedZetacls):
+        assert cls(1, "a") < cls(1, "b")
+
+
+def test_order_le_equal_instances() -> None:
+    for cls in (RankedDatacls, RankedZetacls):
+        a = cls(1, "x")
+        b = cls(1, "x")
+        assert a <= b
+        assert b <= a
+
+
+def test_order_gt() -> None:
+    for cls in (RankedDatacls, RankedZetacls):
+        assert cls(2) > cls(1)
+
+
+def test_order_ge_equal() -> None:
+    for cls in (RankedDatacls, RankedZetacls):
+        a = cls(3, "z")
+        assert a >= cls(3, "z")
+
+
+def test_order_false_raises_type_error() -> None:
+    z1, z2 = PersonZetacls(), PersonZetacls()
+    with pytest.raises(TypeError):
+        _ = z1 < z2
+    with pytest.raises(TypeError):
+        _ = z1 > z2
+
+
+def test_order_requires_eq() -> None:
+    with pytest.raises(ValueError):
+        dataclass(eq=False, order=True)(_Point)
+    with pytest.raises(ValueError):
+        zetaclass(eq=False, order=True)(_Point)
+
+
+# ── frozen=True ───────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ImmutablePointDatacls:
+    x: float = 0.0
+    label: str = ""
+
+
+@zetaclass(frozen=True)
+class ImmutablePointZetacls:
+    x: float = 0.0
+    label: str = ""
+
+
+def test_frozen_init_works() -> None:
+    for cls in (ImmutablePointDatacls, ImmutablePointZetacls):
+        p = cls(1.0, "a")
+        assert p.x == 1.0
+        assert p.label == "a"
+
+
+def test_frozen_rejects_numeric_setattr() -> None:
+    for cls in (ImmutablePointDatacls, ImmutablePointZetacls):
+        with pytest.raises(AttributeError):
+            setattr(cls(), "x", 9.0)
+
+
+def test_frozen_rejects_string_setattr() -> None:
+    for cls in (ImmutablePointDatacls, ImmutablePointZetacls):
+        with pytest.raises(AttributeError):
+            setattr(cls(), "label", "mutated")
+
+
+def test_frozen_is_hashable() -> None:
+    for cls in (ImmutablePointDatacls, ImmutablePointZetacls):
+        assert isinstance(hash(cls(1.0, "a")), int)
+
+
+def test_frozen_equal_instances_have_equal_hash() -> None:
+    for cls in (ImmutablePointDatacls, ImmutablePointZetacls):
+        a = cls(2.5, "hi")
+        b = cls(2.5, "hi")
+        assert a == b
+        assert hash(a) == hash(b)
+
+
+def test_frozen_usable_as_dict_key() -> None:
+    for cls in (ImmutablePointDatacls, ImmutablePointZetacls):
+        a = cls(1.0, "x")
+        b = cls(1.0, "x")
+        assert {a: "value"}[b] == "value"
+
+
+# ── unsafe_hash=True ──────────────────────────────────────────────────────────
+
+
+@dataclass(unsafe_hash=True)
+class UnsafeHashDatacls:
+    count: int = 0
+
+
+@zetaclass(unsafe_hash=True)
+class UnsafeHashZetacls:
+    count: int = 0
+
+
+def test_unsafe_hash_is_hashable() -> None:
+    for cls in (UnsafeHashDatacls, UnsafeHashZetacls):
+        assert isinstance(hash(cls(5)), int)
+
+
+def test_unsafe_hash_equal_instances_have_equal_hash() -> None:
+    for cls in (UnsafeHashDatacls, UnsafeHashZetacls):
+        assert hash(cls(7)) == hash(cls(7))
+
+
+def test_unsafe_hash_mutable() -> None:
+    for cls in (UnsafeHashDatacls, UnsafeHashZetacls):
+        obj = cls(1)
+        obj.count = 99
+        assert obj.count == 99

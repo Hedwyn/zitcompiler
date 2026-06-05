@@ -59,10 +59,10 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             f"zetaclass: keyword arguments not yet supported: {', '.join(sorted(kwargs))}",
         )
     if order and not eq:
-        raise TypeError("zetaclass: order=True requires eq=True")
+        raise ValueError("zetaclass: eq must be true if order is true")
     hash_opt = frozen or unsafe_hash
     if hash_opt and not eq:
-        raise TypeError("zetaclass: cannot use hash with eq=False")
+        raise ValueError("zetaclass: cannot use hash with eq=False")
 
     hints = get_type_hints(cls)
     field_names = list(hints.keys())
