@@ -132,18 +132,24 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     else:
         field_descs = []
         for fname in field_names:
-            default_str = _default_value_zig(fname, defaults[fname]) if fname in defaults else ".required"
+            default_str = (
+                _default_value_zig(fname, defaults[fname]) if fname in defaults else ".required"
+            )
             field_descs.append(f'.{{ .name = "{fname}", .default = {default_str} }}')
-        lines.append(f"const {data_type}Fields = [_]core.FieldDescriptor{{ {', '.join(field_descs)} }};")
+        lines.append(
+            f"const {data_type}Fields = [_]core.FieldDescriptor{{ {', '.join(field_descs)} }};"
+        )
         lines.append("")
         obj_def = f"core.wrapAsPythonObjectUnvalidated({data_type}Fields.len)"
         fields_ref = f"&{data_type}Fields"
-    lines.extend([
-        f"pub const {class_name}Object = {obj_def};",
-        "",
-        f"pub export var {class_name}Type: core.PyTypeObject = "
-        f'core.makeTypeObject({class_name}Object, "{class_name}", {fields_ref}, {_make_opts()});',
-    ])
+    lines.extend(
+        [
+            f"pub const {class_name}Object = {obj_def};",
+            "",
+            f"pub export var {class_name}Type: core.PyTypeObject = "
+            f'core.makeTypeObject({class_name}Object, "{class_name}", {fields_ref}, {_make_opts()});',
+        ]
+    )
     params_src = "\n".join(lines)
 
     with tempfile.TemporaryDirectory() as tmp:

@@ -163,6 +163,9 @@ extern var PyUnicode_Type: PyTypeObject;
 extern var _Py_TrueStruct: PyObject;
 extern var _Py_FalseStruct: PyObject;
 extern var _Py_NotImplementedStruct: PyObject;
+extern var PyExc_ValueError: *PyObject;
+extern fn PyBytes_FromStringAndSize(v: ?[*]const u8, len: Py_ssize_t) ?*PyObject;
+extern fn PyBytes_AsStringAndSize(obj: ?*PyObject, buffer: *[*]u8, length: *Py_ssize_t) c_int;
 
 const Py_LT: c_int = 0;
 const Py_LE: c_int = 1;
@@ -177,6 +180,7 @@ const Py_TPFLAGS_HEAPTYPE: c_ulong = 1 << 9;
 const Py_TPFLAGS_HAVE_GC: c_ulong = 1 << 14;
 
 // PyMethodDef ml_flags
+const METH_NOARGS: c_int = 0x0004;
 const METH_O: c_int = 0x0008;
 const METH_CLASS: c_int = 0x0010;
 const METH_STATIC: c_int = 0x0020;
@@ -196,7 +200,6 @@ pub fn wrapAsPythonObject(comptime DataType: type) type {
     comptime std.debug.assert(@offsetOf(T, "ob_base") == 0);
     return T;
 }
-
 // ── Internal comptime helpers ─────────────────────────────────────────────────
 
 fn assertObBase(comptime T: type) void {
@@ -212,6 +215,38 @@ fn getDataType(comptime T: type) type {
         if (std.mem.eql(u8, fld.name, "data")) return fld.type;
     }
     @compileError(@typeName(T) ++ ": expected field `data`");
+}
+
+fn hasPointerOrSlice(comptime DataType: type) bool {
+    inline for (@typeInfo(DataType).@"struct".fields) |field| {
+        switch (@typeInfo(field.type)) {
+            .pointer => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn writeU64Le(buf: [*]u8, off: usize, val: u64) void {
+    buf[off + 0] = @truncate(val);
+    buf[off + 1] = @truncate(val >> 8);
+    buf[off + 2] = @truncate(val >> 16);
+    buf[off + 3] = @truncate(val >> 24);
+    buf[off + 4] = @truncate(val >> 32);
+    buf[off + 5] = @truncate(val >> 40);
+    buf[off + 6] = @truncate(val >> 48);
+    buf[off + 7] = @truncate(val >> 56);
+}
+
+fn readU64Le(buf: [*]const u8, off: usize) u64 {
+    return @as(u64, buf[off + 0]) |
+        (@as(u64, buf[off + 1]) << 8) |
+        (@as(u64, buf[off + 2]) << 16) |
+        (@as(u64, buf[off + 3]) << 24) |
+        (@as(u64, buf[off + 4]) << 32) |
+        (@as(u64, buf[off + 5]) << 40) |
+        (@as(u64, buf[off + 6]) << 48) |
+        (@as(u64, buf[off + 7]) << 56);
 }
 
 fn checkFieldType(comptime FieldType: type, arg: ?*PyObject) bool {
@@ -271,6 +306,153 @@ fn buildCachedValue(comptime FieldType: type, native_ptr: *const FieldType, arg:
             break :blk arg;
         },
         else => @compileError("unsupported field type: " ++ @typeName(FieldType)),
+    };
+}
+
+// ── pack / unpack ─────────────────────────────────────────────────────────────
+
+/// Returns a namespace containing `call` for the `pack()` instance method.
+///
+/// No pointer/slice fields: serializes the entire struct in one shot (raw struct bytes
+/// including layout padding). Frozen structs can be cast directly; mutable structs are
+/// memcopied — PyBytes_FromStringAndSize copies in both cases, so the result is identical.
+/// Has pointer/slice fields ([:0]const u8 strings): field-by-field serialization.
+/// i64/f64 are 8 bytes little-endian; strings are an 8-byte LE length prefix followed
+/// by the raw UTF-8 bytes (no null terminator in the payload).
+pub fn packFn(comptime T: type, comptime frozen: bool) type {
+    _ = frozen; // future: expose struct memory via buffer protocol for zero-copy on frozen
+    comptime assertObBase(T);
+    const DataType = getDataType(T);
+    const has_ptr = comptime hasPointerOrSlice(DataType);
+    return struct {
+        pub fn call(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
+            const self: *const T = @ptrCast(@alignCast(self_obj.?));
+            if (comptime !has_ptr) {
+                return PyBytes_FromStringAndSize(
+                    @as([*]const u8, @ptrCast(&self.data)),
+                    @as(Py_ssize_t, @intCast(@sizeOf(DataType))),
+                );
+            } else {
+                var total: usize = 0;
+                inline for (@typeInfo(DataType).@"struct".fields) |field| {
+                    total += switch (field.type) {
+                        i64, f64 => 8,
+                        [:0]const u8 => 8 + @field(self.data, field.name).len,
+                        else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                    };
+                }
+                const raw = PyMem_Malloc(total) orelse {
+                    PyErr_SetString(PyExc_MemoryError, "pack: out of memory");
+                    return null;
+                };
+                defer PyMem_Free(raw);
+                const buf: [*]u8 = @ptrCast(raw);
+                var off: usize = 0;
+                inline for (@typeInfo(DataType).@"struct".fields) |field| {
+                    switch (field.type) {
+                        i64, f64 => {
+                            writeU64Le(buf, off, @bitCast(@field(self.data, field.name)));
+                            off += 8;
+                        },
+                        [:0]const u8 => {
+                            const s = @field(self.data, field.name);
+                            writeU64Le(buf, off, s.len);
+                            off += 8;
+                            @memcpy((buf + off)[0..s.len], s);
+                            off += s.len;
+                        },
+                        else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                    }
+                }
+                return PyBytes_FromStringAndSize(@ptrCast(buf), @intCast(total));
+            }
+        }
+    };
+}
+
+/// Returns a namespace containing `call` for the `unpack(bytes)` classmethod.
+///
+/// Inverse of packFn. Allocates and returns a new instance populated from the packed bytes.
+/// No-pointer structs: direct memcopy of the raw struct bytes (must match @sizeOf exactly).
+/// Structs with string fields: field-by-field deserialization; each string is reconstructed
+/// as a Python str object that is stored in py_cache to keep the borrowed UTF-8 slice alive.
+pub fn unpackFn(comptime T: type) type {
+    comptime assertObBase(T);
+    const DataType = getDataType(T);
+    const has_ptr = comptime hasPointerOrSlice(DataType);
+    return struct {
+        pub fn call(cls_obj: ?*PyObject, bytes_obj: ?*PyObject) callconv(.c) ?*PyObject {
+            const tp: *PyTypeObject = @ptrCast(@alignCast(cls_obj.?));
+            var raw_buf: [*]u8 = undefined;
+            var raw_len: Py_ssize_t = undefined;
+            if (PyBytes_AsStringAndSize(bytes_obj, &raw_buf, &raw_len) < 0) return null;
+            const new_obj = PyType_GenericNew(tp, null, null) orelse return null;
+            const self: *T = @ptrCast(@alignCast(new_obj));
+            // py_cache is zeroed by tp_alloc; tp_dealloc handles cleanup on any early return.
+            if (comptime !has_ptr) {
+                if (raw_len != @as(Py_ssize_t, @intCast(@sizeOf(DataType)))) {
+                    PyErr_SetString(PyExc_ValueError, "unpack: wrong byte length");
+                    Py_DecRef(new_obj);
+                    return null;
+                }
+                @memcpy(
+                    @as([*]u8, @ptrCast(&self.data))[0..@sizeOf(DataType)],
+                    raw_buf[0..@sizeOf(DataType)],
+                );
+            } else {
+                const buf: [*]const u8 = raw_buf;
+                const buf_len: usize = @intCast(raw_len);
+                var off: usize = 0;
+                inline for (@typeInfo(DataType).@"struct".fields, 0..) |field, i| {
+                    switch (field.type) {
+                        i64, f64 => {
+                            if (off + 8 > buf_len) {
+                                PyErr_SetString(PyExc_ValueError, "unpack: buffer too short");
+                                Py_DecRef(new_obj);
+                                return null;
+                            }
+                            @field(self.data, field.name) = @bitCast(readU64Le(buf, off));
+                            off += 8;
+                        },
+                        [:0]const u8 => {
+                            if (off + 8 > buf_len) {
+                                PyErr_SetString(PyExc_ValueError, "unpack: buffer too short");
+                                Py_DecRef(new_obj);
+                                return null;
+                            }
+                            const str_len: usize = @intCast(readU64Le(buf, off));
+                            off += 8;
+                            if (off + str_len > buf_len) {
+                                PyErr_SetString(PyExc_ValueError, "unpack: buffer too short");
+                                Py_DecRef(new_obj);
+                                return null;
+                            }
+                            // Reconstruct a Python str; cache it to keep the UTF-8 buffer alive
+                            // for the borrowed native slice.
+                            const py_str = PyUnicode_FromStringAndSize(
+                                buf + off,
+                                @intCast(str_len),
+                            ) orelse {
+                                Py_DecRef(new_obj);
+                                return null;
+                            };
+                            var actual_size: Py_ssize_t = 0;
+                            const ptr = PyUnicode_AsUTF8AndSize(py_str, &actual_size) orelse {
+                                Py_DecRef(py_str);
+                                Py_DecRef(new_obj);
+                                return null;
+                            };
+                            self.py_cache[i] = py_str; // dealloc releases this
+                            const n: usize = @intCast(actual_size);
+                            @field(self.data, field.name) = if (n == 0) "" else ptr[0..n :0];
+                            off += str_len;
+                        },
+                        else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                    }
+                }
+            }
+            return new_obj;
+        }
     };
 }
 
@@ -386,6 +568,51 @@ pub fn methodsArray() type {
     };
     return struct {
         pub var array: [3]PyMethodDef = init_array;
+    };
+}
+
+/// Like methodsArray() but also exposes pack() and unpack() for the validated path.
+pub fn methodsArrayValidated(comptime T: type, comptime frozen: bool) type {
+    const TypeCheck = struct {
+        fn call(cls_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*PyObject {
+            const r = PyObject_IsInstance(arg, cls_obj);
+            if (r < 0) return null;
+            const ret: *PyObject = if (r > 0) &_Py_TrueStruct else &_Py_FalseStruct;
+            Py_IncRef(ret);
+            return ret;
+        }
+    };
+    const Pack = packFn(T, frozen);
+    const Unpack = unpackFn(T);
+    const init_array = [5]PyMethodDef{
+        .{
+            .ml_name = "is_zetaclass",
+            .ml_meth = @ptrCast(@constCast(&TypeCheck.call)),
+            .ml_flags = METH_CLASS | METH_O,
+            .ml_doc = null,
+        },
+        .{
+            .ml_name = "is_instance",
+            .ml_meth = @ptrCast(@constCast(&TypeCheck.call)),
+            .ml_flags = METH_CLASS | METH_O,
+            .ml_doc = null,
+        },
+        .{
+            .ml_name = "pack",
+            .ml_meth = @ptrCast(@constCast(&Pack.call)),
+            .ml_flags = METH_NOARGS,
+            .ml_doc = null,
+        },
+        .{
+            .ml_name = "unpack",
+            .ml_meth = @ptrCast(@constCast(&Unpack.call)),
+            .ml_flags = METH_CLASS | METH_O,
+            .ml_doc = null,
+        },
+        std.mem.zeroes(PyMethodDef),
+    };
+    return struct {
+        pub var array: [5]PyMethodDef = init_array;
     };
 }
 
@@ -1018,7 +1245,7 @@ pub fn makeTypeObject(
         .tp_weaklistoffset = 0,
         .tp_iter = null,
         .tp_iternext = null,
-        .tp_methods = &methodsArray().array,
+        .tp_methods = if (opts.validate) &methodsArrayValidated(T, opts.frozen).array else &methodsArray().array,
         .tp_members = if (opts.validate)
             &membersArray().array
         else
