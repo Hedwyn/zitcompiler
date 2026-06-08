@@ -39,6 +39,7 @@ class DataclassKwargs(TypedDict, total=False):
     kw_only: bool
     slots: bool
     weakref_slot: bool
+    validate: bool
 
 
 _CORE_ZIG = Path(__file__).parent / "core.zig"
@@ -54,6 +55,7 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     weakref_slot = kwargs.pop("weakref_slot", False)
     repr_opt = kwargs.pop("repr", True)
     match_args = kwargs.pop("match_args", True)
+    validate = kwargs.pop("validate", True)
     if "slots" in kwargs:
         if not kwargs.pop("slots"):
             warnings.warn(
@@ -76,9 +78,10 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     field_names = list(hints.keys())
     field_pairs = [(n, hints[n]) for n in field_names]
 
-    for _, ftype in field_pairs:
-        if ftype not in ZIG_TYPE_MAP:
-            raise TypeError(f"zetaclass: unsupported field type {ftype!r}")
+    if validate:
+        for _, ftype in field_pairs:
+            if ftype not in ZIG_TYPE_MAP:
+                raise TypeError(f"zetaclass: unsupported field type {ftype!r}")
 
     # Collect defaults by walking MRO (closest definition wins)
     defaults: dict[str, object] = {}
@@ -94,22 +97,66 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     def _make_boolean(v: bool) -> str:
         return str(v).lower()
 
-    params_src = "\n".join(
-        [
-            'const core = @import("core");',
-            "",
-            *generate_zig_struct(data_type, field_pairs, defaults),
-            "",
-            f"pub const {class_name}Object = core.wrapAsPythonObject({data_type});",
-            "",
-            f"pub export var {class_name}Type: core.PyTypeObject = "
-            f'core.makeTypeObject({class_name}Object, "{class_name}", '
+    def _make_opts() -> str:
+        return (
             f".{{ .init = {_make_boolean(init)}, .repr = {_make_boolean(repr_opt)}, "
             f".eq = {_make_boolean(eq)}, .order = {_make_boolean(order)}, "
             f".hash = {_make_boolean(hash_opt)}, .frozen = {_make_boolean(frozen)}, "
-            f".kw_only = {_make_boolean(kw_only)}, .weakref_slot = {_make_boolean(weakref_slot)} }});",
-        ]
-    )
+            f".kw_only = {_make_boolean(kw_only)}, .weakref_slot = {_make_boolean(weakref_slot)} }}"
+        )
+
+    def _default_value_zig(name: str, val: object) -> str:
+        if isinstance(val, bool):
+            raise TypeError(
+                f"zetaclass: bool defaults not supported for validate=False field {name!r}"
+            )
+        if isinstance(val, int):
+            return f".{{ .int = {val} }}"
+        if isinstance(val, float):
+            return f".{{ .float = {repr(float(val))} }}"
+        if isinstance(val, str):
+            escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+            return f'.{{ .string = "{escaped}" }}'
+        raise TypeError(
+            f"zetaclass: unsupported default type {type(val).__name__!r} for field {name!r} "
+            "in validate=False mode; only int, float, str defaults are supported"
+        )
+
+    if validate:
+        params_src = "\n".join(
+            [
+                'const core = @import("core");',
+                "",
+                *generate_zig_struct(data_type, field_pairs, defaults),
+                "",
+                f"pub const {class_name}Object = core.wrapAsPythonObject({data_type});",
+                "",
+                f"pub export var {class_name}Type: core.PyTypeObject = "
+                f'core.makeTypeObject({class_name}Object, "{class_name}", {_make_opts()});',
+            ]
+        )
+    else:
+        field_descs = []
+        for name in field_names:
+            if name in defaults:
+                default_str = _default_value_zig(name, defaults[name])
+            else:
+                default_str = ".required"
+            field_descs.append(f'.{{ .name = "{name}", .default = {default_str} }}')
+        fields_arr = f"[_]core.FieldDescriptor{{ {', '.join(field_descs)} }}"
+        params_src = "\n".join(
+            [
+                'const core = @import("core");',
+                "",
+                f"const {data_type}Fields = {fields_arr};",
+                "",
+                f"pub const {class_name}Object = core.wrapAsPythonObjectUnvalidated({data_type}Fields.len);",
+                "",
+                f"pub export var {class_name}Type: core.PyTypeObject = "
+                f'core.makeTypeObjectUnvalidated({class_name}Object, "{class_name}", '
+                f"&{data_type}Fields, {_make_opts()});",
+            ]
+        )
 
     with tempfile.TemporaryDirectory() as tmp:
         params_path = Path(tmp) / "params.zig"

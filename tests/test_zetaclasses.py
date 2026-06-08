@@ -571,3 +571,171 @@ def test_type_validation_setattr_str_rejects_int() -> None:
     obj = _TypeValidated()
     with pytest.raises(TypeError):
         obj.label = 42  # type: ignore[assignment]
+
+
+# ── Python-object cache ───────────────────────────────────────────────────────
+
+
+@zetaclass
+class _CacheTarget:
+    count: int = 0
+    ratio: float = 0.0
+    label: str = ""
+
+
+def test_cache_get_returns_same_object_on_repeated_access() -> None:
+    obj = _CacheTarget(count=7)
+    # First access populates the cache; subsequent accesses must return the
+    # same Python object (same id = same pointer, no repeated boxing).
+    first = obj.count
+    second = obj.count
+    assert first == second == 7
+    assert first is second
+
+
+def test_cache_string_get_returns_same_object() -> None:
+    obj = _CacheTarget(label="hello")
+    first = obj.label
+    second = obj.label
+    assert first == second == "hello"
+    assert first is second
+
+
+def test_cache_float_get_returns_same_object() -> None:
+    obj = _CacheTarget(ratio=3.14)
+    first = obj.ratio
+    second = obj.ratio
+    assert first == second
+    assert first is second
+
+
+def test_cache_init_explicit_arg_cached() -> None:
+    # When an explicit arg is passed to __init__ the cache is populated
+    # immediately; the returned object must be a float (even if int was
+    # passed, coercion normalises to float in the native + cache).
+    obj = _CacheTarget(ratio=2)
+    val = obj.ratio
+    assert val == 2.0
+    assert isinstance(val, float)
+    assert obj.ratio is val
+
+
+def test_cache_default_is_lazy() -> None:
+    # When no arg is passed the cache starts null; first access builds it.
+    obj = _CacheTarget()  # uses defaults, cache = null
+    first = obj.count
+    second = obj.count
+    assert first == second == 0
+    assert first is second
+
+
+def test_cache_setter_updates_value_and_cache() -> None:
+    obj = _CacheTarget(count=1)
+    _ = obj.count  # populate cache
+    obj.count = 99
+    assert obj.count == 99
+    # Cache must reflect the new value on all subsequent reads.
+    assert obj.count is obj.count
+
+
+def test_cache_str_setter_updates_value_and_cache() -> None:
+    obj = _CacheTarget(label="old")
+    _ = obj.label  # populate cache
+    obj.label = "new"
+    assert obj.label == "new"
+    assert obj.label is obj.label
+
+
+def test_cache_no_corruption_after_multiple_sets() -> None:
+    obj = _CacheTarget(count=0, ratio=0.0, label="a")
+    for i in range(5):
+        obj.count = i
+        obj.ratio = float(i) * 0.5
+        obj.label = str(i)
+        assert obj.count == i
+        assert obj.ratio == float(i) * 0.5
+        assert obj.label == str(i)
+
+
+def test_cache_independent_across_instances() -> None:
+    a = _CacheTarget(count=1, label="x")
+    b = _CacheTarget(count=2, label="y")
+    # Mutations on one instance must not affect the other's cache.
+    _ = a.count
+    _ = b.count
+    a.count = 10
+    assert a.count == 10
+    assert b.count == 2
+
+
+def test_cache_invalid_setattr_leaves_cache_consistent() -> None:
+    obj = _CacheTarget(count=42)
+    _ = obj.count  # warm cache
+    with pytest.raises(TypeError):
+        obj.count = "bad"  # type: ignore[assignment]
+    # Cache and native must still reflect the original value.
+    assert obj.count == 42
+    assert obj.count is obj.count
+
+
+# ── validate=False ────────────────────────────────────────────────────────────
+
+
+@zetaclass(validate=False)
+class _Unvalidated:
+    count: int = 0
+    label: str = "hello"
+    score: float = 1.5
+
+
+def test_validate_false_init_defaults() -> None:
+    obj = _Unvalidated()
+    assert obj.count == 0
+    assert obj.label == "hello"
+    assert obj.score == 1.5
+
+
+def test_validate_false_init_positional() -> None:
+    obj = _Unvalidated(42, "world", 3.14)
+    assert obj.count == 42
+    assert obj.label == "world"
+    assert obj.score == 3.14
+
+
+def test_validate_false_init_kwargs() -> None:
+    obj = _Unvalidated(count=7, label="x")
+    assert obj.count == 7
+    assert obj.label == "x"
+    assert obj.score == 1.5
+
+
+def test_validate_false_setattr_accepts_wrong_type() -> None:
+    obj = _Unvalidated()
+    obj.count = "not an int"  # type: ignore[assignment]
+    assert obj.count == "not an int"
+
+
+def test_validate_false_setattr_updates_value() -> None:
+    obj = _Unvalidated(count=1)
+    obj.count = 99
+    assert obj.count == 99
+
+
+def test_validate_false_eq() -> None:
+    assert _Unvalidated() == _Unvalidated()
+    assert _Unvalidated(count=1) != _Unvalidated(count=2)
+
+
+def test_validate_false_repr_contains_fields() -> None:
+    obj = _Unvalidated(count=5, label="hi", score=0.5)
+    r = repr(obj)
+    assert "count" in r
+    assert "label" in r
+    assert "score" in r
+
+
+def test_validate_false_fields_compatible() -> None:
+    from dataclasses import fields
+
+    zc_fields = {f.name: f for f in fields(_Unvalidated)}
+    assert set(zc_fields) == {"count", "label", "score"}

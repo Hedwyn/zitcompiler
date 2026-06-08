@@ -20,6 +20,11 @@
 //! string field is heap-allocated and owned by the struct instance).
 //! Fields with no default simply omit the declaration; missing arguments at
 //! init time will raise TypeError.
+//!
+//! Each DataType field has a corresponding py_cache slot (?*PyObject) in the
+//! wrapper struct. Getters check the cache first (populate on miss, IncRef on
+//! return). Setters update both native and cache. Dealloc DecRefs all cached
+//! objects.
 //! @date: 04.06.2026
 //! @author: Baptiste Pestourie
 
@@ -148,6 +153,7 @@ extern fn PyUnicode_AsUTF8AndSize(unicode: ?*PyObject, size: *Py_ssize_t) ?[*]co
 extern fn PyUnicode_FromStringAndSize(u: ?[*]const u8, size: Py_ssize_t) ?*PyObject;
 extern fn PyMem_Malloc(n: usize) ?*anyopaque;
 extern fn PyMem_Free(p: ?*anyopaque) void;
+extern fn PyObject_Hash(obj: ?*PyObject) Py_ssize_t;
 extern var PyExc_TypeError: *PyObject;
 extern var PyExc_AttributeError: *PyObject;
 extern var PyExc_MemoryError: *PyObject;
@@ -170,10 +176,6 @@ const Py_TPFLAGS_MANAGED_DICT: c_ulong = 1 << 4;
 const Py_TPFLAGS_HEAPTYPE: c_ulong = 1 << 9;
 const Py_TPFLAGS_HAVE_GC: c_ulong = 1 << 14;
 
-// PyMemberDef type codes (descrobject.h, Python 3.12+; structmember.h aliases these)
-const Py_T_DOUBLE: c_int = 4;
-const Py_T_LONGLONG: c_int = 17;
-
 // PyMethodDef ml_flags
 const METH_O: c_int = 0x0008;
 const METH_CLASS: c_int = 0x0010;
@@ -181,11 +183,14 @@ const METH_STATIC: c_int = 0x0020;
 
 // ── Public comptime helpers ───────────────────────────────────────────────────
 
-/// Wraps a data struct as a Python object struct by prepending `ob_base: PyObject`.
+/// Wraps a data struct as a Python object struct by prepending `ob_base: PyObject`
+/// and a `py_cache` array (one ?*PyObject slot per DataType field, null = uncached).
 /// The returned type is suitable for use as the Object struct in makeTypeObject.
 pub fn wrapAsPythonObject(comptime DataType: type) type {
+    const n = @typeInfo(DataType).@"struct".fields.len;
     const T = struct {
         ob_base: PyObject,
+        py_cache: [n]?*PyObject,
         data: DataType,
     };
     comptime std.debug.assert(@offsetOf(T, "ob_base") == 0);
@@ -200,28 +205,13 @@ fn assertObBase(comptime T: type) void {
         @compileError(@typeName(T) ++ ": first field must be `ob_base: PyObject`");
 }
 
-/// Returns the type of the `data` field (second field of the Object struct).
+/// Returns the type of the `data` field, located by name.
 fn getDataType(comptime T: type) type {
     const flds = @typeInfo(T).@"struct".fields;
-    if (flds.len < 2 or !std.mem.eql(u8, flds[1].name, "data"))
-        @compileError(@typeName(T) ++ ": expected second field `data`");
-    return flds[1].type;
-}
-
-fn memberTypeCode(comptime FieldType: type) c_int {
-    return switch (FieldType) {
-        i64 => Py_T_LONGLONG,
-        f64 => Py_T_DOUBLE,
-        else => @compileError("unsupported zetaclass field type for tp_members: " ++ @typeName(FieldType)),
-    };
-}
-
-fn hasStringFields(comptime T: type) bool {
-    const DataType = getDataType(T);
-    inline for (@typeInfo(DataType).@"struct".fields) |field| {
-        if (field.type == [:0]const u8) return true;
+    inline for (flds) |fld| {
+        if (std.mem.eql(u8, fld.name, "data")) return fld.type;
     }
-    return false;
+    @compileError(@typeName(T) ++ ": expected field `data`");
 }
 
 fn checkFieldType(comptime FieldType: type, arg: ?*PyObject) bool {
@@ -244,8 +234,10 @@ fn fieldTypeError(comptime FieldType: type) [*:0]const u8 {
     };
 }
 
-// Store a Python arg into a struct field.
-// For [:0]const u8: extracts UTF-8 bytes, frees the previous allocation, copies to new heap buffer.
+// Store a Python arg into a native struct field.
+// For [:0]const u8: borrows a pointer directly into the Python object's internal UTF-8 buffer.
+// The caller is responsible for keeping the Python object alive (via py_cache) for as long as
+// the native slice is in use.  No heap allocation or copy is performed.
 fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void {
     if (!checkFieldType(FieldType, arg)) {
         PyErr_SetString(PyExc_TypeError, fieldTypeError(FieldType));
@@ -256,121 +248,105 @@ fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void 
         f64 => dest.* = PyFloat_AsDouble(arg),
         [:0]const u8 => {
             var size: Py_ssize_t = 0;
+            // PyUnicode_AsUTF8AndSize guarantees null-termination; the returned pointer
+            // is stable for the lifetime of the unicode object.
             const ptr = PyUnicode_AsUTF8AndSize(arg, &size) orelse return;
             const n: usize = @intCast(size);
-            const old = dest.*;
-            if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
-            if (n == 0) {
-                dest.* = "";
-                return;
-            }
-            const buf: [*]u8 = @ptrCast(PyMem_Malloc(n + 1) orelse {
-                PyErr_SetString(PyExc_MemoryError, "zetaclass: out of memory for string field");
-                return;
-            });
-            @memcpy(buf[0..n], ptr[0..n]);
-            buf[n] = 0;
-            dest.* = buf[0..n :0];
+            dest.* = if (n == 0) "" else ptr[0..n :0];
         },
         else => @compileError("unsupported zetaclass field type: " ++ @typeName(FieldType)),
     }
 }
 
-// ── tp_members array ──────────────────────────────────────────────────────────
+// Build the canonical Python object for a native field value.
+// For [:0]const u8 we IncRef the original Python arg instead of allocating a new string.
+// For i64/f64 we construct from the stored native value (ensures correct type after coercion).
+fn buildCachedValue(comptime FieldType: type, native_ptr: *const FieldType, arg: ?*PyObject) ?*PyObject {
+    return switch (FieldType) {
+        i64 => PyLong_FromLongLong(@as(c_longlong, @intCast(native_ptr.*))),
+        f64 => PyFloat_FromDouble(native_ptr.*),
+        [:0]const u8 => blk: {
+            // arg is the Python str object; IncRef and reuse it.
+            Py_IncRef(arg);
+            break :blk arg;
+        },
+        else => @compileError("unsupported field type: " ++ @typeName(FieldType)),
+    };
+}
 
-/// Returns a namespace with a static `array: [N+1]PyMemberDef` for numeric fields.
-/// [:0]const u8 (string) fields are excluded — they are exposed via tp_getset instead.
-pub fn membersArray(comptime T: type) type {
-    comptime assertObBase(T);
-    const DataType = getDataType(T);
-    const data_fields = @typeInfo(DataType).@"struct".fields;
-    const data_offset = @offsetOf(T, "data");
+// ── tp_members array (empty sentinel) ────────────────────────────────────────
 
-    comptime var N: usize = 0;
-    inline for (data_fields) |field| {
-        if (field.type != [:0]const u8) N += 1;
-    }
-
-    comptime var init_array: [N + 1]PyMemberDef = std.mem.zeroes([N + 1]PyMemberDef);
-    comptime var idx: usize = 0;
-    inline for (data_fields) |field| {
-        if (field.type != [:0]const u8) {
-            init_array[idx] = .{
-                .name = @ptrCast(field.name.ptr),
-                .member_type = memberTypeCode(field.type),
-                .offset = @intCast(data_offset + @offsetOf(DataType, field.name)),
-                .flags = 0,
-                .doc = null,
-            };
-            idx += 1;
-        }
-    }
-    const members_init = init_array;
+/// All fields are exposed via tp_getset (with caching). tp_members is always empty.
+pub fn membersArray() type {
+    const init_array = [1]PyMemberDef{std.mem.zeroes(PyMemberDef)};
     return struct {
-        pub var array: [N + 1]PyMemberDef = members_init;
+        pub var array: [1]PyMemberDef = init_array;
     };
 }
 
 // ── tp_getset array ───────────────────────────────────────────────────────────
 
-/// Returns a namespace with a static `array: [N+1]PyGetSetDef` for [:0]const u8 fields.
-/// The getter returns a new Python str from the stored bytes.
-/// The setter extracts UTF-8 bytes, frees the old buffer, copies the new bytes.
-/// When frozen=true the set pointer is null (making the field read-only at the descriptor level).
+/// Returns a namespace with a static `array: [N+1]PyGetSetDef` for ALL fields.
+///
+/// Getter: checks py_cache[i]; on miss builds the Python object from native,
+///         stores it in cache (cache holds one ref), then returns it with an
+///         additional IncRef for the caller.
+/// Setter: updates the native field via storeField, then updates py_cache[i]
+///         (DecRef old, build canonical Python value, cache it).
+/// When frozen=true the set pointer is null (read-only descriptor).
 pub fn getsetArray(comptime T: type, comptime frozen: bool) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
     const data_fields = @typeInfo(DataType).@"struct".fields;
-
-    comptime var N: usize = 0;
-    inline for (data_fields) |field| {
-        if (field.type == [:0]const u8) N += 1;
-    }
+    const N = data_fields.len;
 
     comptime var init_array: [N + 1]PyGetSetDef = std.mem.zeroes([N + 1]PyGetSetDef);
-    comptime var idx: usize = 0;
-    inline for (data_fields) |field| {
-        if (field.type == [:0]const u8) {
-            const FieldAccessor = struct {
-                fn get(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
-                    const self: *T = @ptrCast(@alignCast(self_obj.?));
-                    const s = @field(self.data, field.name);
-                    return PyUnicode_FromStringAndSize(s.ptr, @intCast(s.len));
+    inline for (data_fields, 0..) |field, i| {
+        const FieldAccessor = struct {
+            fn get(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
+                const self: *T = @ptrCast(@alignCast(self_obj.?));
+                const cache = &self.py_cache[i];
+                if (cache.* == null) {
+                    const py_val: ?*PyObject = switch (field.type) {
+                        i64 => PyLong_FromLongLong(@as(c_longlong, @intCast(@field(self.data, field.name)))),
+                        f64 => PyFloat_FromDouble(@field(self.data, field.name)),
+                        [:0]const u8 => blk: {
+                            const s = @field(self.data, field.name);
+                            break :blk PyUnicode_FromStringAndSize(s.ptr, @intCast(s.len));
+                        },
+                        else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                    };
+                    if (py_val == null) return null;
+                    cache.* = py_val; // cache holds one reference
                 }
-                fn set(self_obj: ?*PyObject, value: ?*PyObject, _: ?*anyopaque) callconv(.c) c_int {
-                    const self: *T = @ptrCast(@alignCast(self_obj.?));
-                    if (PyObject_IsInstance(value, @as(?*PyObject, @ptrCast(&PyUnicode_Type))) <= 0) {
-                        PyErr_SetString(PyExc_TypeError, "expected str");
-                        return -1;
-                    }
-                    var size: Py_ssize_t = 0;
-                    const ptr = PyUnicode_AsUTF8AndSize(value, &size) orelse return -1;
-                    const n: usize = @intCast(size);
-                    const old = @field(self.data, field.name);
-                    if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
-                    if (n == 0) {
-                        @field(self.data, field.name) = "";
-                        return 0;
-                    }
-                    const buf: [*]u8 = @ptrCast(PyMem_Malloc(n + 1) orelse {
-                        PyErr_SetString(PyExc_MemoryError, "zetaclass: out of memory for string setter");
-                        return -1;
-                    });
-                    @memcpy(buf[0..n], ptr[0..n]);
-                    buf[n] = 0;
-                    @field(self.data, field.name) = buf[0..n :0];
-                    return 0;
+                Py_IncRef(cache.*);
+                return cache.*;
+            }
+            fn set(self_obj: ?*PyObject, value: ?*PyObject, _: ?*anyopaque) callconv(.c) c_int {
+                const self: *T = @ptrCast(@alignCast(self_obj.?));
+                // Update native (handles type checking and string heap management).
+                storeField(field.type, &@field(self.data, field.name), value);
+                if (PyErr_Occurred() != null) return -1;
+                // Update cache: DecRef old, build canonical Python value, store.
+                const cache = &self.py_cache[i];
+                if (cache.*) |old| Py_DecRef(old);
+                const py_val = buildCachedValue(field.type, &@field(self.data, field.name), value);
+                if (py_val == null) {
+                    // OOM building numeric wrapper; native updated, invalidate cache.
+                    cache.* = null;
+                    return -1;
                 }
-            };
-            init_array[idx] = .{
-                .name = @ptrCast(field.name.ptr),
-                .get = @ptrCast(@constCast(&FieldAccessor.get)),
-                .set = if (frozen) null else @ptrCast(@constCast(&FieldAccessor.set)),
-                .doc = null,
-                .closure = null,
-            };
-            idx += 1;
-        }
+                cache.* = py_val;
+                return 0;
+            }
+        };
+        init_array[i] = .{
+            .name = @ptrCast(field.name.ptr),
+            .get = @ptrCast(@constCast(&FieldAccessor.get)),
+            .set = if (frozen) null else @ptrCast(@constCast(&FieldAccessor.set)),
+            .doc = null,
+            .closure = null,
+        };
     }
     const getset_init = init_array;
     return struct {
@@ -419,7 +395,9 @@ pub fn methodsArray() type {
 ///
 /// Fields are populated in declaration order from positional args, then keyword
 /// args by field name, then inline struct field defaults via field.defaultValue().
-/// [:0]const u8 defaults are heap-copied to maintain the ownership invariant.
+/// When an explicit Python arg is provided it is also cached immediately in
+/// py_cache[i] (canonical Python value built from the stored native value).
+/// When a default is used the cache slot is left null (lazy build on first get).
 pub fn initFn(comptime T: type, comptime kw_only: bool) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
@@ -443,28 +421,23 @@ pub fn initFn(comptime T: type, comptime kw_only: bool) type {
                 else
                     null;
 
+                const cache = &self.py_cache[i];
+
                 if (arg != null) {
                     storeField(field.type, &@field(self.data, field.name), arg);
                     if (PyErr_Occurred() != null) return -1;
+                    // Cache immediately: DecRef any stale value, build canonical Python obj.
+                    if (cache.*) |old| Py_DecRef(old);
+                    const py_val = buildCachedValue(field.type, &@field(self.data, field.name), arg);
+                    if (py_val == null) return -1;
+                    cache.* = py_val;
                 } else if (field.defaultValue()) |dv| {
-                    if (field.type == [:0]const u8) {
-                        const n = dv.len;
-                        const old = @field(self.data, field.name);
-                        if (old.len > 0) PyMem_Free(@ptrCast(@constCast(old.ptr)));
-                        if (n == 0) {
-                            @field(self.data, field.name) = "";
-                        } else {
-                            const buf: [*]u8 = @ptrCast(PyMem_Malloc(n + 1) orelse {
-                                PyErr_SetString(PyExc_MemoryError, "zetaclass __init__: out of memory for string default");
-                                return -1;
-                            });
-                            @memcpy(buf[0..n], dv[0..n]);
-                            buf[n] = 0;
-                            @field(self.data, field.name) = buf[0..n :0];
-                        }
-                    } else {
-                        @field(self.data, field.name) = dv;
-                    }
+                    // Zero-copy: for strings, point directly to the Zig static default
+                    // literal (always valid; no heap allocation needed).
+                    @field(self.data, field.name) = dv;
+                    // Clear stale cache so the getter rebuilds from native on first access.
+                    if (cache.*) |old| Py_DecRef(old);
+                    cache.* = null;
                 } else {
                     PyErr_SetString(PyExc_TypeError, "zetaclass __init__: missing required argument");
                     return -1;
@@ -643,7 +616,9 @@ pub fn reprFn(comptime T: type, comptime class_name: [:0]const u8) type {
 // ── tp_dealloc ────────────────────────────────────────────────────────────────
 
 /// Returns a namespace containing `call` for tp_dealloc.
-/// Only frees heap-allocated [:0]const u8 fields owned by the zetaclass instance.
+/// DecRefs all cached PyObject slots.  String fields are zero-copy borrows from
+/// those Python objects, so releasing the cache entries is sufficient — no
+/// separate heap memory to free.
 ///
 /// In Python 3.12+, @zetaclass wraps the Zig base type in a Python heap subtype
 /// via type(). That heap subtype gets tp_dealloc = subtype_dealloc. CPython's
@@ -652,16 +627,333 @@ pub fn reprFn(comptime T: type, comptime class_name: [:0]const u8) type {
 /// base-class dealloc. We must not repeat any of those steps.
 pub fn deallocFn(comptime T: type) type {
     const DataType = getDataType(T);
+    const n = @typeInfo(DataType).@"struct".fields.len;
     return struct {
         pub fn call(self_obj: ?*PyObject) callconv(.c) void {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
-            inline for (@typeInfo(DataType).@"struct".fields) |field| {
-                if (field.type == [:0]const u8) {
-                    const s = @field(self.data, field.name);
-                    if (s.len > 0) PyMem_Free(@ptrCast(@constCast(s.ptr)));
-                }
+            // Releasing cache entries frees all resources: numeric Python wrappers
+            // are released, and string fields' borrowed pointers become unreachable
+            // once their backing unicode objects are DecRef'd here.
+            inline for (0..n) |i| {
+                if (self.py_cache[i]) |cached| Py_DecRef(cached);
             }
         }
+    };
+}
+
+// ── validate=False (unvalidated) path ────────────────────────────────────────
+
+/// Default-value descriptor for an unvalidated field.
+/// `.required` means no default (caller must supply the argument).
+pub const DefaultValue = union(enum) {
+    required,
+    int: i64,
+    float: f64,
+    string: [:0]const u8,
+};
+
+/// Bundles the field name and its default value for the unvalidated path.
+pub const FieldDescriptor = struct {
+    name: [:0]const u8,
+    default: DefaultValue,
+};
+
+/// Python object layout for validate=False: ob_base + N raw PyObject* slots.
+/// No native data struct, no py_cache.
+pub fn wrapAsPythonObjectUnvalidated(comptime N: usize) type {
+    return struct {
+        ob_base: PyObject,
+        slots: [N]?*PyObject,
+    };
+}
+
+fn getSlotCount(comptime T: type) usize {
+    for (@typeInfo(T).@"struct".fields) |fld| {
+        if (std.mem.eql(u8, fld.name, "slots")) return @typeInfo(fld.type).array.len;
+    }
+    @compileError(@typeName(T) ++ ": no `slots` field");
+}
+
+const T_OBJECT_EX: c_int = 16;
+const READONLY: c_int = 1;
+
+/// Generates a [N+1]PyMemberDef array using T_OBJECT_EX, one entry per slot.
+/// When frozen=true each member is marked READONLY.
+pub fn membersArrayUnvalidated(
+    comptime T: type,
+    comptime field_descs: []const FieldDescriptor,
+    comptime frozen: bool,
+) type {
+    const N = field_descs.len;
+    comptime var init_array: [N + 1]PyMemberDef = std.mem.zeroes([N + 1]PyMemberDef);
+    inline for (field_descs, 0..) |fd, i| {
+        init_array[i] = .{
+            .name = @ptrCast(fd.name.ptr),
+            .member_type = T_OBJECT_EX,
+            .offset = @intCast(@offsetOf(T, "slots") + @sizeOf(?*PyObject) * i),
+            .flags = if (frozen) READONLY else 0,
+            .doc = null,
+        };
+    }
+    const members_init = init_array;
+    return struct {
+        pub var array: [N + 1]PyMemberDef = members_init;
+    };
+}
+
+/// tp_init for the unvalidated path.
+/// Stores Python objects directly in slots without type conversion.
+pub fn initFnUnvalidated(
+    comptime T: type,
+    comptime field_descs: []const FieldDescriptor,
+    comptime kw_only: bool,
+) type {
+    return struct {
+        pub fn call(
+            self_obj: ?*PyObject,
+            args: ?*PyObject,
+            kwargs: ?*PyObject,
+        ) callconv(.c) c_int {
+            const self: *T = @ptrCast(@alignCast(self_obj.?));
+            const nargs: usize = if (args != null) @intCast(PyTuple_Size(args)) else 0;
+            if (kw_only and nargs > 0) {
+                PyErr_SetString(PyExc_TypeError, "zetaclass __init__() takes 0 positional arguments (kw_only=True)");
+                return -1;
+            }
+            inline for (field_descs, 0..) |fd, i| {
+                const arg: ?*PyObject = if (!kw_only and i < nargs)
+                    PyTuple_GetItem(args, @intCast(i))
+                else if (kwargs != null)
+                    PyDict_GetItemString(kwargs, @as([*:0]const u8, @ptrCast(fd.name.ptr)))
+                else
+                    null;
+
+                if (arg != null) {
+                    if (self.slots[i]) |old| Py_DecRef(old);
+                    Py_IncRef(arg);
+                    self.slots[i] = arg;
+                } else {
+                    switch (fd.default) {
+                        .required => {
+                            PyErr_SetString(PyExc_TypeError, "zetaclass __init__: missing required argument");
+                            return -1;
+                        },
+                        .int => |v| {
+                            if (self.slots[i]) |old| Py_DecRef(old);
+                            self.slots[i] = PyLong_FromLongLong(@as(c_longlong, @intCast(v)));
+                            if (self.slots[i] == null) return -1;
+                        },
+                        .float => |v| {
+                            if (self.slots[i]) |old| Py_DecRef(old);
+                            self.slots[i] = PyFloat_FromDouble(v);
+                            if (self.slots[i] == null) return -1;
+                        },
+                        .string => |v| {
+                            if (self.slots[i]) |old| Py_DecRef(old);
+                            self.slots[i] = PyUnicode_FromStringAndSize(v.ptr, @intCast(v.len));
+                            if (self.slots[i] == null) return -1;
+                        },
+                    }
+                }
+            }
+            return 0;
+        }
+    };
+}
+
+/// tp_dealloc for the unvalidated path: DecRefs all slot values.
+pub fn deallocFnUnvalidated(comptime T: type) type {
+    const N = getSlotCount(T);
+    return struct {
+        pub fn call(self_obj: ?*PyObject) callconv(.c) void {
+            const self: *T = @ptrCast(@alignCast(self_obj.?));
+            inline for (0..N) |i| {
+                if (self.slots[i]) |obj| Py_DecRef(obj);
+            }
+        }
+    };
+}
+
+/// tp_repr for the unvalidated path.
+pub fn reprFnUnvalidated(
+    comptime T: type,
+    comptime field_descs: []const FieldDescriptor,
+    comptime class_name: [:0]const u8,
+) type {
+    return struct {
+        pub fn call(self_obj: ?*PyObject) callconv(.c) ?*PyObject {
+            const self: *const T = @ptrCast(@alignCast(self_obj.?));
+            var result: ?*PyObject = PyUnicode_FromStringAndSize(class_name.ptr, @intCast(class_name.len));
+            appendConcat(&result, PyUnicode_FromStringAndSize("(", 1));
+            inline for (field_descs, 0..) |fd, i| {
+                if (i > 0) appendConcat(&result, PyUnicode_FromStringAndSize(", ", 2));
+                appendConcat(&result, PyUnicode_FromStringAndSize(fd.name.ptr, @intCast(fd.name.len)));
+                appendConcat(&result, PyUnicode_FromStringAndSize("=", 1));
+                const val = self.slots[i];
+                const val_repr = if (val != null) PyObject_Repr(val) else PyUnicode_FromStringAndSize("None", 4);
+                if (val_repr == null) {
+                    if (result) |r| Py_DecRef(r);
+                    return null;
+                }
+                appendConcat(&result, val_repr);
+            }
+            appendConcat(&result, PyUnicode_FromStringAndSize(")", 1));
+            return result;
+        }
+    };
+}
+
+/// tp_richcompare for the unvalidated path.
+/// Equality: field-by-field PyObject_RichCompareBool.
+/// Order (when order=true): lexicographic via Python comparisons.
+pub fn richCompareFnUnvalidated(comptime T: type, comptime order: bool) type {
+    const N = getSlotCount(T);
+    return struct {
+        pub fn call(
+            a_obj: ?*PyObject,
+            b_obj: ?*PyObject,
+            op: c_int,
+        ) callconv(.c) ?*PyObject {
+            if (a_obj == null or b_obj == null) {
+                Py_IncRef(&_Py_NotImplementedStruct);
+                return &_Py_NotImplementedStruct;
+            }
+            const a_hdr: *PyObject = @ptrCast(@alignCast(a_obj));
+            const b_hdr: *PyObject = @ptrCast(@alignCast(b_obj));
+            if (a_hdr.ob_type != b_hdr.ob_type) {
+                Py_IncRef(&_Py_NotImplementedStruct);
+                return &_Py_NotImplementedStruct;
+            }
+            if (!order and op != Py_EQ and op != Py_NE) {
+                Py_IncRef(&_Py_NotImplementedStruct);
+                return &_Py_NotImplementedStruct;
+            }
+            const a: *const T = @ptrCast(@alignCast(a_obj));
+            const b: *const T = @ptrCast(@alignCast(b_obj));
+
+            if (op == Py_EQ or op == Py_NE) {
+                inline for (0..N) |i| {
+                    const eq = PyObject_RichCompareBool(a.slots[i], b.slots[i], Py_EQ);
+                    if (eq < 0) return null;
+                    if (eq == 0) {
+                        const ret: *PyObject = if (op == Py_NE) &_Py_TrueStruct else &_Py_FalseStruct;
+                        Py_IncRef(ret);
+                        return ret;
+                    }
+                }
+                const ret: *PyObject = if (op == Py_EQ) &_Py_TrueStruct else &_Py_FalseStruct;
+                Py_IncRef(ret);
+                return ret;
+            } else {
+                inline for (0..N) |i| {
+                    const lt = PyObject_RichCompareBool(a.slots[i], b.slots[i], Py_LT);
+                    if (lt < 0) return null;
+                    if (lt > 0) {
+                        const result = op == Py_LT or op == Py_LE;
+                        const ret: *PyObject = if (result) &_Py_TrueStruct else &_Py_FalseStruct;
+                        Py_IncRef(ret);
+                        return ret;
+                    }
+                    const gt = PyObject_RichCompareBool(a.slots[i], b.slots[i], Py_GT);
+                    if (gt < 0) return null;
+                    if (gt > 0) {
+                        const result = op == Py_GT or op == Py_GE;
+                        const ret: *PyObject = if (result) &_Py_TrueStruct else &_Py_FalseStruct;
+                        Py_IncRef(ret);
+                        return ret;
+                    }
+                }
+                const result = op == Py_LE or op == Py_GE;
+                const ret: *PyObject = if (result) &_Py_TrueStruct else &_Py_FalseStruct;
+                Py_IncRef(ret);
+                return ret;
+            }
+        }
+    };
+}
+
+/// tp_hash for the unvalidated path: feeds PyObject_Hash of each slot into Wyhash.
+pub fn hashFnUnvalidated(comptime T: type) type {
+    const N = getSlotCount(T);
+    return struct {
+        pub fn call(self_obj: ?*PyObject) callconv(.c) Py_ssize_t {
+            const self: *const T = @ptrCast(@alignCast(self_obj.?));
+            var hasher = std.hash.Wyhash.init(0);
+            inline for (0..N) |i| {
+                const h = PyObject_Hash(self.slots[i]);
+                if (h == -1) return -1;
+                std.hash.autoHash(&hasher, @as(usize, @bitCast(h)));
+            }
+            const raw: usize = @truncate(hasher.final());
+            const result: Py_ssize_t = @bitCast(raw);
+            return if (result == -1) -2 else result;
+        }
+    };
+}
+
+/// Build a PyTypeObject for the unvalidated path (validate=False).
+/// Uses tp_members (T_OBJECT_EX) instead of tp_getset; no native data struct.
+pub fn makeTypeObjectUnvalidated(
+    comptime T: type,
+    comptime name: [:0]const u8,
+    comptime field_descs: []const FieldDescriptor,
+    comptime opts: makeTypeOptions,
+) PyTypeObject {
+    return PyTypeObject{
+        .ob_base = .{ .ob_base = .{ .ob_refcnt = 1, .ob_type = null }, .ob_size = 0 },
+        .tp_name = name.ptr,
+        .tp_basicsize = @sizeOf(T),
+        .tp_itemsize = 0,
+        .tp_dealloc = @ptrCast(@constCast(&deallocFnUnvalidated(T).call)),
+        .tp_vectorcall_offset = 0,
+        .tp_getattr = null,
+        .tp_setattr = null,
+        .tp_as_async = null,
+        .tp_repr = if (opts.repr) @ptrCast(@constCast(&reprFnUnvalidated(T, field_descs, name).call)) else null,
+        .tp_as_number = null,
+        .tp_as_sequence = null,
+        .tp_as_mapping = null,
+        .tp_hash = if (opts.hash) @ptrCast(@constCast(&hashFnUnvalidated(T).call)) else null,
+        .tp_call = null,
+        .tp_str = null,
+        .tp_getattro = null,
+        .tp_setattro = if (opts.frozen) @ptrCast(@constCast(&frozenSetAttrFn().call)) else null,
+        .tp_as_buffer = null,
+        .tp_flags = Py_TPFLAGS_BASETYPE | (if (opts.weakref_slot) Py_TPFLAGS_MANAGED_WEAKREF else 0),
+        .tp_doc = null,
+        .tp_traverse = null,
+        .tp_clear = null,
+        .tp_richcompare = if (opts.eq) @ptrCast(@constCast(&richCompareFnUnvalidated(T, opts.order).call)) else null,
+        .tp_weaklistoffset = 0,
+        .tp_iter = null,
+        .tp_iternext = null,
+        .tp_methods = &methodsArray().array,
+        .tp_members = &membersArrayUnvalidated(T, field_descs, opts.frozen).array,
+        .tp_getset = null,
+        .tp_base = null,
+        .tp_dict = null,
+        .tp_descr_get = null,
+        .tp_descr_set = null,
+        .tp_dictoffset = 0,
+        .tp_init = if (opts.init)
+            @ptrCast(@constCast(&initFnUnvalidated(T, field_descs, opts.kw_only).call))
+        else
+            @ptrCast(@constCast(&noInitFn().call)),
+        .tp_alloc = null,
+        .tp_new = &PyType_GenericNew,
+        .tp_free = null,
+        .tp_is_gc = null,
+        .tp_bases = null,
+        .tp_mro = null,
+        .tp_cache = null,
+        .tp_subclasses = null,
+        .tp_weaklist = null,
+        .tp_del = null,
+        .tp_version_tag = 0,
+        .tp_finalize = null,
+        .tp_vectorcall = null,
+        .tp_watched = 0,
+        .tp_versions_used = 0,
     };
 }
 
@@ -735,12 +1027,11 @@ pub const makeTypeOptions = struct {
 };
 
 /// Build a PyTypeObject for an Object struct of the form:
-///   struct { ob_base: PyObject, data: SomeDataStruct }
+///   struct { ob_base: PyObject, py_cache: [N]?*PyObject, data: SomeDataStruct }
 /// Assign to an `export var` in generated params.zig, then load via load_class().
 ///
-/// All defaults use Zig inline field syntax; [:0]const u8 defaults are heap-copied on init.
-/// Numeric defaults use Zig inline field syntax.
-/// opts: makeTypeOptions controlling which slots are generated.
+/// All fields are exposed via tp_getset (with Python-object caching).
+/// tp_members is always empty; tp_dealloc always frees cache refs and string heap.
 pub fn makeTypeObject(
     comptime T: type,
     comptime name: [:0]const u8,
@@ -751,10 +1042,7 @@ pub fn makeTypeObject(
         .tp_name = name.ptr,
         .tp_basicsize = @sizeOf(T),
         .tp_itemsize = 0,
-        .tp_dealloc = if (hasStringFields(T))
-            @ptrCast(@constCast(&deallocFn(T).call))
-        else
-            null,
+        .tp_dealloc = @ptrCast(@constCast(&deallocFn(T).call)),
         .tp_vectorcall_offset = 0,
         .tp_getattr = null,
         .tp_setattr = null,
@@ -778,8 +1066,8 @@ pub fn makeTypeObject(
         .tp_iter = null,
         .tp_iternext = null,
         .tp_methods = &methodsArray().array,
-        .tp_members = &membersArray(T).array,
-        .tp_getset = if (hasStringFields(T)) &getsetArray(T, opts.frozen).array else null,
+        .tp_members = &membersArray().array,
+        .tp_getset = &getsetArray(T, opts.frozen).array,
         .tp_base = null,
         .tp_dict = null,
         .tp_descr_get = null,
