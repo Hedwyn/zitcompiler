@@ -152,15 +152,24 @@ def zetaclass(
     cls: type | None = None,
     **kwargs: Unpack[DataclassKwargs],
 ) -> type | Callable[[type], type]:
-    """Compile and load a native dataclass-compatible type backed by Zig.
+    """Drop-in native replacement for @dataclass backed by a JIT-compiled Zig struct.
 
-    Inspects annotations from cls and its bases, compiles a Zig struct with
-    native __init__ (including defaults) and __eq__ slots.
+    Accepts all the same keyword arguments as @dataclass:
+      init, repr, eq, order, unsafe_hash, frozen, match_args, kw_only,
+      slots, weakref_slot.
 
-    Accepts the same keyword arguments as @dataclass. Supported: init, eq.
-    Any other argument raises NotImplementedError.
+    Usable as @zetaclass or @zetaclass(frozen=True, order=True, ...).
 
-    Usable as @zetaclass or @zetaclass(init=False, eq=True, ...).
+    Differences from @dataclass
+    ---------------------------
+    slots: always effectively True — the underlying Zig struct uses a fixed
+        memory layout equivalent to __slots__. Passing slots=False emits a
+        UserWarning and is otherwise ignored.
+
+    __hash__: when hash is enabled (frozen=True or unsafe_hash=True) the hash
+        value is computed by a native Wyhash over the raw field bytes and will
+        differ numerically from the tuple-based hash that @dataclass produces.
+        The hash contract (equal objects have equal hashes) is preserved.
     """
     if cls is not None:
         return _zetaclass_impl(cls, **kwargs)

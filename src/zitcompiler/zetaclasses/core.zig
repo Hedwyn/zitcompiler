@@ -136,6 +136,7 @@ extern fn PyErr_SetString(exc: ?*PyObject, msg: [*:0]const u8) void;
 extern fn PyErr_Occurred() ?*PyObject;
 extern fn PyObject_RichCompareBool(a: ?*PyObject, b: ?*PyObject, op: c_int) c_int;
 extern fn PyObject_Free(ptr: ?*anyopaque) void;
+extern fn PyObject_IsInstance(inst: ?*PyObject, cls: ?*PyObject) c_int;
 extern fn PyObject_Repr(obj: ?*PyObject) ?*PyObject;
 extern fn PyUnicode_Concat(left: ?*PyObject, right: ?*PyObject) ?*PyObject;
 extern fn PyLong_FromLongLong(v: c_longlong) ?*PyObject;
@@ -169,6 +170,11 @@ const Py_TPFLAGS_HAVE_GC: c_ulong = 1 << 14;
 // PyMemberDef type codes (descrobject.h, Python 3.12+; structmember.h aliases these)
 const Py_T_DOUBLE: c_int = 4;
 const Py_T_LONGLONG: c_int = 17;
+
+// PyMethodDef ml_flags
+const METH_O: c_int = 0x0008;
+const METH_CLASS: c_int = 0x0010;
+const METH_STATIC: c_int = 0x0020;
 
 // ── Public comptime helpers ───────────────────────────────────────────────────
 
@@ -338,6 +344,41 @@ pub fn getsetArray(comptime T: type, comptime frozen: bool) type {
     const getset_init = init_array;
     return struct {
         pub var array: [N + 1]PyGetSetDef = getset_init;
+    };
+}
+
+// ── tp_methods array ──────────────────────────────────────────────────────────
+
+/// Returns a namespace with a static `array: [3]PyMethodDef` containing:
+///   is_zetaclass(obj)  — classmethod, PyObject_IsInstance(obj, cls).
+///   is_instance(obj)   — classmethod, PyObject_IsInstance(obj, cls).
+pub fn methodsArray() type {
+    const TypeCheck = struct {
+        fn call(cls_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*PyObject {
+            const r = PyObject_IsInstance(arg, cls_obj);
+            if (r < 0) return null;
+            const ret: *PyObject = if (r > 0) &_Py_TrueStruct else &_Py_FalseStruct;
+            Py_IncRef(ret);
+            return ret;
+        }
+    };
+    const init_array = [3]PyMethodDef{
+        .{
+            .ml_name = "is_zetaclass",
+            .ml_meth = @ptrCast(@constCast(&TypeCheck.call)),
+            .ml_flags = METH_CLASS | METH_O,
+            .ml_doc = null,
+        },
+        .{
+            .ml_name = "is_instance",
+            .ml_meth = @ptrCast(@constCast(&TypeCheck.call)),
+            .ml_flags = METH_CLASS | METH_O,
+            .ml_doc = null,
+        },
+        std.mem.zeroes(PyMethodDef),
+    };
+    return struct {
+        pub var array: [3]PyMethodDef = init_array;
     };
 }
 
@@ -571,54 +612,23 @@ pub fn reprFn(comptime T: type, comptime class_name: [:0]const u8) type {
 // ── tp_dealloc ────────────────────────────────────────────────────────────────
 
 /// Returns a namespace containing `call` for tp_dealloc.
-/// Frees heap-allocated [:0]const u8 fields, then frees the object memory.
-/// Only used for types that have string fields; otherwise tp_dealloc is left null
-/// and PyType_Ready inherits the default from object.
+/// Only frees heap-allocated [:0]const u8 fields owned by the zetaclass instance.
 ///
-/// This deallocator is inherited by Python-level subclasses created via
-/// `type(name, (NativeType,), ...)` (which is how @zetaclass produces the final
-/// type). Such subclasses are heap types: they add a managed __dict__ and the
-/// Py_TPFLAGS_HAVE_GC flag, so their instances are GC-tracked and allocated with a
-/// gc_head prefix. It must therefore mirror CPython's subtype_dealloc: untrack from
-/// the GC list, release the managed dict/weakrefs, free via the type's own tp_free
-/// (PyObject_GC_Del for GC types — NOT PyObject_Free, which would free the wrong
-/// block), and drop the instance's reference to its heap type.
+/// In Python 3.12+, @zetaclass wraps the Zig base type in a Python heap subtype
+/// via type(). That heap subtype gets tp_dealloc = subtype_dealloc. CPython's
+/// subtype_dealloc handles GC untrack, managed weakrefs, managed dict, tp_free,
+/// and the HEAPTYPE type-reference decrement — then calls this function as the
+/// base-class dealloc. We must not repeat any of those steps.
 pub fn deallocFn(comptime T: type) type {
     const DataType = getDataType(T);
     return struct {
         pub fn call(self_obj: ?*PyObject) callconv(.c) void {
             const self: *T = @ptrCast(@alignCast(self_obj.?));
-            const hdr: *PyObject = @ptrCast(@alignCast(self_obj.?));
-            const tp: *PyTypeObject = @ptrCast(@alignCast(hdr.ob_type.?));
-
-            // Remove from the GC list before freeing, or the next collection
-            // walks a dangling gc_head and crashes.
-            if ((tp.tp_flags & Py_TPFLAGS_HAVE_GC) != 0) {
-                PyObject_GC_UnTrack(@ptrCast(self_obj));
-            }
-            if ((tp.tp_flags & Py_TPFLAGS_MANAGED_WEAKREF) != 0) {
-                PyObject_ClearWeakRefs(self_obj);
-            }
-
             inline for (@typeInfo(DataType).@"struct".fields) |field| {
                 if (field.type == [:0]const u8) {
                     const s = @field(self.data, field.name);
                     if (s.len > 0) PyMem_Free(@ptrCast(@constCast(s.ptr)));
                 }
-            }
-
-            // Subclasses created from Python carry a managed __dict__ that the
-            // base type's deallocator owns the release of.
-            if ((tp.tp_flags & Py_TPFLAGS_MANAGED_DICT) != 0) {
-                PyObject_ClearManagedDict(self_obj);
-            }
-
-            const free_fn: *const fn (?*anyopaque) callconv(.c) void = @ptrCast(tp.tp_free.?);
-            free_fn(self_obj);
-
-            // Instances of a heap type hold a strong reference to that type.
-            if ((tp.tp_flags & Py_TPFLAGS_HEAPTYPE) != 0) {
-                Py_DecRef(@ptrCast(tp));
             }
         }
     };
@@ -736,7 +746,7 @@ pub fn makeTypeObject(
         .tp_weaklistoffset = 0,
         .tp_iter = null,
         .tp_iternext = null,
-        .tp_methods = null,
+        .tp_methods = &methodsArray().array,
         .tp_members = &membersArray(T).array,
         .tp_getset = if (hasStringFields(T)) &getsetArray(T, opts.frozen).array else null,
         .tp_base = null,

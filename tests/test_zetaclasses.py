@@ -476,3 +476,52 @@ def test_match_args_structural_pattern_matching() -> None:
         case _:
             result = "no match"
     assert result == "hi"
+
+
+# ── is_zetaclass / is_instance ────────────────────────────────────────────────
+
+
+@zetaclass
+class _IsInstanceA:
+    x: int = 0
+
+
+@zetaclass
+class _IsInstanceB:
+    y: float = 0.0
+
+
+class _SubA(_IsInstanceA):
+    pass
+
+
+def test_is_zetaclass_direct() -> None:
+    assert _IsInstanceA.is_zetaclass(_IsInstanceA()) is True
+
+
+def test_is_zetaclass_subclass() -> None:
+    assert _IsInstanceA.is_zetaclass(_SubA()) is True
+
+
+def test_is_zetaclass_other_zetaclass() -> None:
+    assert _IsInstanceA.is_zetaclass(_IsInstanceB()) is False
+
+
+def test_is_zetaclass_non_zetaclass() -> None:
+    assert _IsInstanceA.is_zetaclass(object()) is False
+
+
+def test_is_instance_direct() -> None:
+    assert _IsInstanceA.is_instance(_IsInstanceA()) is True
+
+
+def test_is_instance_subclass() -> None:
+    assert _IsInstanceA.is_instance(_SubA()) is True
+
+
+def test_is_instance_other_zetaclass_is_false() -> None:
+    assert _IsInstanceA.is_instance(_IsInstanceB()) is False
+
+
+def test_is_instance_non_zetaclass_is_false() -> None:
+    assert _IsInstanceA.is_instance(object()) is False
