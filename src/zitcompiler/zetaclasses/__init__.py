@@ -134,7 +134,7 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     if validate:
         lines.extend(generate_zig_struct(data_type, field_pairs, defaults))
         lines.append("")
-        obj_def = f"core.wrapAsPythonObject({data_type})"
+        obj_def = f"core.wrapAsPythonObject({data_type}, {_make_boolean(validate)}, {_make_boolean(packed)})"
         fields_ref = "&[_]core.FieldDescriptor{}"
     else:
         field_descs = []

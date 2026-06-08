@@ -10,7 +10,7 @@
 //!       height: f64 = 1.77,
 //!   };
 //!
-//!   pub const PersonObject = core.wrapAsPythonObject(PersonData);
+//!   pub const PersonObject = core.wrapAsPythonObject(PersonData, true, false);
 //!
 //!   pub export var PersonType: core.PyTypeObject =
 //!       core.makeTypeObject(PersonObject, "Person", .{});
@@ -190,12 +190,19 @@ const METH_STATIC: c_int = 0x0020;
 /// Wraps a data struct as a Python object struct by prepending `ob_base: PyObject`
 /// and a `py_cache` array (one ?*PyObject slot per DataType field, null = uncached).
 /// The returned type is suitable for use as the Object struct in makeTypeObject.
-pub fn wrapAsPythonObject(comptime DataType: type) type {
+/// validate: include py_cache (for tp_getset lazy caching).
+/// pack:     include data (for pack/unpack native struct access).
+/// At least one of validate or pack must be true; both may be true.
+/// When validate=false, py_cache is void (zero-size, no storage).
+pub fn wrapAsPythonObject(comptime DataType: type, comptime validate: bool, comptime pack: bool) type {
+    comptime std.debug.assert(validate or pack);
     const n = @typeInfo(DataType).@"struct".fields.len;
+    const CacheType = if (validate) [n]?*PyObject else void;
+    const DataField = if (validate or pack) DataType else void;
     const T = struct {
         ob_base: PyObject,
-        py_cache: [n]?*PyObject,
-        data: DataType,
+        py_cache: CacheType,
+        data: DataField,
     };
     comptime std.debug.assert(@offsetOf(T, "ob_base") == 0);
     return T;
