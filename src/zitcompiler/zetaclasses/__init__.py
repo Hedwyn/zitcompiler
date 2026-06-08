@@ -40,6 +40,7 @@ class DataclassKwargs(TypedDict, total=False):
     slots: bool
     weakref_slot: bool
     validate: bool
+    packed: bool
 
 
 _CORE_ZIG = Path(__file__).parent / "core.zig"
@@ -55,7 +56,13 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     weakref_slot = kwargs.pop("weakref_slot", False)
     repr_opt = kwargs.pop("repr", True)
     match_args = kwargs.pop("match_args", True)
+    validate_explicit = "validate" in kwargs
     validate = kwargs.pop("validate", False)
+    packed = kwargs.pop("packed", False)
+    if packed:
+        if validate_explicit and not validate:
+            raise ValueError("zetaclass: packed=True requires validate=True")
+        validate = True
     if "slots" in kwargs:
         if not kwargs.pop("slots"):
             warnings.warn(
@@ -103,7 +110,7 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             f".eq = {_make_boolean(eq)}, .order = {_make_boolean(order)}, "
             f".hash = {_make_boolean(hash_opt)}, .frozen = {_make_boolean(frozen)}, "
             f".kw_only = {_make_boolean(kw_only)}, .weakref_slot = {_make_boolean(weakref_slot)}, "
-            f".validate = {_make_boolean(validate)} }}"
+            f".validate = {_make_boolean(validate)}, .pack = {_make_boolean(packed)} }}"
         )
 
     def _default_value_zig(name: str, val: object) -> str:

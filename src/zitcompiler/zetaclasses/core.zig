@@ -1188,6 +1188,8 @@ pub const makeTypeOptions = struct {
     /// When true: native Zig struct + tp_getset with type validation (validate=True path).
     /// When false: raw PyObject* slots + tp_members, no type conversion (validate=False path).
     validate: bool = true,
+    /// Expose pack() / unpack() methods. Requires validate=true.
+    pack: bool = false,
 };
 
 /// Build a PyTypeObject for a zetaclass object.
@@ -1245,7 +1247,7 @@ pub fn makeTypeObject(
         .tp_weaklistoffset = 0,
         .tp_iter = null,
         .tp_iternext = null,
-        .tp_methods = if (opts.validate) &methodsArrayValidated(T, opts.frozen).array else &methodsArray().array,
+        .tp_methods = if (opts.validate and opts.pack) &methodsArrayValidated(T, opts.frozen).array else &methodsArray().array,
         .tp_members = if (opts.validate)
             &membersArray().array
         else
