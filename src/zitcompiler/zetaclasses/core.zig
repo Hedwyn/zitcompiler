@@ -151,6 +151,9 @@ extern fn PyMem_Free(p: ?*anyopaque) void;
 extern var PyExc_TypeError: *PyObject;
 extern var PyExc_AttributeError: *PyObject;
 extern var PyExc_MemoryError: *PyObject;
+extern var PyLong_Type: PyTypeObject;
+extern var PyFloat_Type: PyTypeObject;
+extern var PyUnicode_Type: PyTypeObject;
 extern var _Py_TrueStruct: PyObject;
 extern var _Py_FalseStruct: PyObject;
 extern var _Py_NotImplementedStruct: PyObject;
@@ -221,9 +224,33 @@ fn hasStringFields(comptime T: type) bool {
     return false;
 }
 
+fn checkFieldType(comptime FieldType: type, arg: ?*PyObject) bool {
+    return switch (FieldType) {
+        i64 => PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(&PyLong_Type))) > 0,
+        // float accepts int (standard Python coercion)
+        f64 => PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(&PyFloat_Type))) > 0 or
+            PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(&PyLong_Type))) > 0,
+        [:0]const u8 => PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(&PyUnicode_Type))) > 0,
+        else => @compileError("unsupported field type: " ++ @typeName(FieldType)),
+    };
+}
+
+fn fieldTypeError(comptime FieldType: type) [*:0]const u8 {
+    return switch (FieldType) {
+        i64 => "expected int",
+        f64 => "expected float or int",
+        [:0]const u8 => "expected str",
+        else => @compileError("unsupported field type: " ++ @typeName(FieldType)),
+    };
+}
+
 // Store a Python arg into a struct field.
 // For [:0]const u8: extracts UTF-8 bytes, frees the previous allocation, copies to new heap buffer.
 fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void {
+    if (!checkFieldType(FieldType, arg)) {
+        PyErr_SetString(PyExc_TypeError, fieldTypeError(FieldType));
+        return;
+    }
     switch (FieldType) {
         i64 => dest.* = @as(i64, @intCast(PyLong_AsLongLong(arg))),
         f64 => dest.* = PyFloat_AsDouble(arg),
@@ -312,6 +339,10 @@ pub fn getsetArray(comptime T: type, comptime frozen: bool) type {
                 }
                 fn set(self_obj: ?*PyObject, value: ?*PyObject, _: ?*anyopaque) callconv(.c) c_int {
                     const self: *T = @ptrCast(@alignCast(self_obj.?));
+                    if (PyObject_IsInstance(value, @as(?*PyObject, @ptrCast(&PyUnicode_Type))) <= 0) {
+                        PyErr_SetString(PyExc_TypeError, "expected str");
+                        return -1;
+                    }
                     var size: Py_ssize_t = 0;
                     const ptr = PyUnicode_AsUTF8AndSize(value, &size) orelse return -1;
                     const n: usize = @intCast(size);

@@ -525,3 +525,49 @@ def test_is_instance_other_zetaclass_is_false() -> None:
 
 def test_is_instance_non_zetaclass_is_false() -> None:
     assert _IsInstanceA.is_instance(object()) is False
+
+
+# ── type validation ───────────────────────────────────────────────────────────
+
+
+@zetaclass
+class _TypeValidated:
+    count: int = 0
+    ratio: float = 0.0
+    label: str = ""
+
+
+def test_type_validation_int_rejects_str() -> None:
+    with pytest.raises(TypeError):
+        _TypeValidated(count="bad")
+
+
+def test_type_validation_int_rejects_float() -> None:
+    with pytest.raises(TypeError):
+        _TypeValidated(count=1.5)
+
+
+def test_type_validation_float_rejects_str() -> None:
+    with pytest.raises(TypeError):
+        _TypeValidated(ratio="bad")
+
+
+def test_type_validation_float_accepts_int() -> None:
+    obj = _TypeValidated(ratio=42)
+    assert obj.ratio == 42.0
+
+
+def test_type_validation_str_rejects_int() -> None:
+    with pytest.raises(TypeError):
+        _TypeValidated(label=42)
+
+
+def test_type_validation_str_rejects_float() -> None:
+    with pytest.raises(TypeError):
+        _TypeValidated(label=1.5)
+
+
+def test_type_validation_setattr_str_rejects_int() -> None:
+    obj = _TypeValidated()
+    with pytest.raises(TypeError):
+        obj.label = 42  # type: ignore[assignment]
