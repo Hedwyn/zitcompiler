@@ -891,72 +891,6 @@ pub fn hashFnUnvalidated(comptime T: type) type {
     };
 }
 
-/// Build a PyTypeObject for the unvalidated path (validate=False).
-/// Uses tp_members (T_OBJECT_EX) instead of tp_getset; no native data struct.
-pub fn makeTypeObjectUnvalidated(
-    comptime T: type,
-    comptime name: [:0]const u8,
-    comptime field_descs: []const FieldDescriptor,
-    comptime opts: makeTypeOptions,
-) PyTypeObject {
-    return PyTypeObject{
-        .ob_base = .{ .ob_base = .{ .ob_refcnt = 1, .ob_type = null }, .ob_size = 0 },
-        .tp_name = name.ptr,
-        .tp_basicsize = @sizeOf(T),
-        .tp_itemsize = 0,
-        .tp_dealloc = @ptrCast(@constCast(&deallocFnUnvalidated(T).call)),
-        .tp_vectorcall_offset = 0,
-        .tp_getattr = null,
-        .tp_setattr = null,
-        .tp_as_async = null,
-        .tp_repr = if (opts.repr) @ptrCast(@constCast(&reprFnUnvalidated(T, field_descs, name).call)) else null,
-        .tp_as_number = null,
-        .tp_as_sequence = null,
-        .tp_as_mapping = null,
-        .tp_hash = if (opts.hash) @ptrCast(@constCast(&hashFnUnvalidated(T).call)) else null,
-        .tp_call = null,
-        .tp_str = null,
-        .tp_getattro = null,
-        .tp_setattro = if (opts.frozen) @ptrCast(@constCast(&frozenSetAttrFn().call)) else null,
-        .tp_as_buffer = null,
-        .tp_flags = Py_TPFLAGS_BASETYPE | (if (opts.weakref_slot) Py_TPFLAGS_MANAGED_WEAKREF else 0),
-        .tp_doc = null,
-        .tp_traverse = null,
-        .tp_clear = null,
-        .tp_richcompare = if (opts.eq) @ptrCast(@constCast(&richCompareFnUnvalidated(T, opts.order).call)) else null,
-        .tp_weaklistoffset = 0,
-        .tp_iter = null,
-        .tp_iternext = null,
-        .tp_methods = &methodsArray().array,
-        .tp_members = &membersArrayUnvalidated(T, field_descs, opts.frozen).array,
-        .tp_getset = null,
-        .tp_base = null,
-        .tp_dict = null,
-        .tp_descr_get = null,
-        .tp_descr_set = null,
-        .tp_dictoffset = 0,
-        .tp_init = if (opts.init)
-            @ptrCast(@constCast(&initFnUnvalidated(T, field_descs, opts.kw_only).call))
-        else
-            @ptrCast(@constCast(&noInitFn().call)),
-        .tp_alloc = null,
-        .tp_new = &PyType_GenericNew,
-        .tp_free = null,
-        .tp_is_gc = null,
-        .tp_bases = null,
-        .tp_mro = null,
-        .tp_cache = null,
-        .tp_subclasses = null,
-        .tp_weaklist = null,
-        .tp_del = null,
-        .tp_version_tag = 0,
-        .tp_finalize = null,
-        .tp_vectorcall = null,
-        .tp_watched = 0,
-        .tp_versions_used = 0,
-    };
-}
-
 // These are kept for use by custom Zig code that may reference PyObject fields directly.
 extern fn Py_IncRef(obj: ?*PyObject) void;
 extern fn Py_DecRef(obj: ?*PyObject) void;
@@ -1024,17 +958,24 @@ pub const makeTypeOptions = struct {
     kw_only: bool = false,
     /// Add Py_TPFLAGS_MANAGED_WEAKREF to enable weakref support.
     weakref_slot: bool = false,
+    /// When true: native Zig struct + tp_getset with type validation (validate=True path).
+    /// When false: raw PyObject* slots + tp_members, no type conversion (validate=False path).
+    validate: bool = true,
 };
 
-/// Build a PyTypeObject for an Object struct of the form:
-///   struct { ob_base: PyObject, py_cache: [N]?*PyObject, data: SomeDataStruct }
-/// Assign to an `export var` in generated params.zig, then load via load_class().
+/// Build a PyTypeObject for a zetaclass object.
 ///
-/// All fields are exposed via tp_getset (with Python-object caching).
-/// tp_members is always empty; tp_dealloc always frees cache refs and string heap.
+/// When opts.validate=true (default), T must be wrapAsPythonObject(DataType) and
+/// field_descs is unused (pass &[_]FieldDescriptor{}).  Fields are exposed via
+/// tp_getset with native type storage and Python-object caching.
+///
+/// When opts.validate=false, T must be wrapAsPythonObjectUnvalidated(N) and
+/// field_descs provides field names and defaults.  Fields are exposed directly
+/// via tp_members (T_OBJECT_EX) with no type conversion.
 pub fn makeTypeObject(
     comptime T: type,
     comptime name: [:0]const u8,
+    comptime field_descs: []const FieldDescriptor,
     comptime opts: makeTypeOptions,
 ) PyTypeObject {
     return PyTypeObject{
@@ -1042,16 +983,25 @@ pub fn makeTypeObject(
         .tp_name = name.ptr,
         .tp_basicsize = @sizeOf(T),
         .tp_itemsize = 0,
-        .tp_dealloc = @ptrCast(@constCast(&deallocFn(T).call)),
+        .tp_dealloc = if (opts.validate)
+            @ptrCast(@constCast(&deallocFn(T).call))
+        else
+            @ptrCast(@constCast(&deallocFnUnvalidated(T).call)),
         .tp_vectorcall_offset = 0,
         .tp_getattr = null,
         .tp_setattr = null,
         .tp_as_async = null,
-        .tp_repr = if (opts.repr) @ptrCast(@constCast(&reprFn(T, name).call)) else null,
+        .tp_repr = if (opts.repr) (if (opts.validate)
+            @ptrCast(@constCast(&reprFn(T, name).call))
+        else
+            @ptrCast(@constCast(&reprFnUnvalidated(T, field_descs, name).call))) else null,
         .tp_as_number = null,
         .tp_as_sequence = null,
         .tp_as_mapping = null,
-        .tp_hash = if (opts.hash) @ptrCast(@constCast(&hashFn(T).call)) else null,
+        .tp_hash = if (opts.hash) (if (opts.validate)
+            @ptrCast(@constCast(&hashFn(T).call))
+        else
+            @ptrCast(@constCast(&hashFnUnvalidated(T).call))) else null,
         .tp_call = null,
         .tp_str = null,
         .tp_getattro = null,
@@ -1061,22 +1011,28 @@ pub fn makeTypeObject(
         .tp_doc = null,
         .tp_traverse = null,
         .tp_clear = null,
-        .tp_richcompare = if (opts.eq) @ptrCast(@constCast(&richCompareFn(T, opts.order).call)) else null,
+        .tp_richcompare = if (opts.eq) (if (opts.validate)
+            @ptrCast(@constCast(&richCompareFn(T, opts.order).call))
+        else
+            @ptrCast(@constCast(&richCompareFnUnvalidated(T, opts.order).call))) else null,
         .tp_weaklistoffset = 0,
         .tp_iter = null,
         .tp_iternext = null,
         .tp_methods = &methodsArray().array,
-        .tp_members = &membersArray().array,
-        .tp_getset = &getsetArray(T, opts.frozen).array,
+        .tp_members = if (opts.validate)
+            &membersArray().array
+        else
+            &membersArrayUnvalidated(T, field_descs, opts.frozen).array,
+        .tp_getset = if (opts.validate) &getsetArray(T, opts.frozen).array else null,
         .tp_base = null,
         .tp_dict = null,
         .tp_descr_get = null,
         .tp_descr_set = null,
         .tp_dictoffset = 0,
-        .tp_init = if (opts.init)
+        .tp_init = if (opts.init) (if (opts.validate)
             @ptrCast(@constCast(&initFn(T, opts.kw_only).call))
         else
-            @ptrCast(@constCast(&noInitFn().call)),
+            @ptrCast(@constCast(&initFnUnvalidated(T, field_descs, opts.kw_only).call))) else @ptrCast(@constCast(&noInitFn().call)),
         .tp_alloc = null,
         .tp_new = &PyType_GenericNew,
         .tp_free = null,

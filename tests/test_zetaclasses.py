@@ -530,7 +530,7 @@ def test_is_instance_non_zetaclass_is_false() -> None:
 # ── type validation ───────────────────────────────────────────────────────────
 
 
-@zetaclass
+@zetaclass(validate=True)
 class _TypeValidated:
     count: int = 0
     ratio: float = 0.0
@@ -576,7 +576,7 @@ def test_type_validation_setattr_str_rejects_int() -> None:
 # ── Python-object cache ───────────────────────────────────────────────────────
 
 
-@zetaclass
+@zetaclass(validate=True)
 class _CacheTarget:
     count: int = 0
     ratio: float = 0.0

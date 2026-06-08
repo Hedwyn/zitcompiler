@@ -55,7 +55,7 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     weakref_slot = kwargs.pop("weakref_slot", False)
     repr_opt = kwargs.pop("repr", True)
     match_args = kwargs.pop("match_args", True)
-    validate = kwargs.pop("validate", True)
+    validate = kwargs.pop("validate", False)
     if "slots" in kwargs:
         if not kwargs.pop("slots"):
             warnings.warn(
@@ -102,7 +102,8 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             f".{{ .init = {_make_boolean(init)}, .repr = {_make_boolean(repr_opt)}, "
             f".eq = {_make_boolean(eq)}, .order = {_make_boolean(order)}, "
             f".hash = {_make_boolean(hash_opt)}, .frozen = {_make_boolean(frozen)}, "
-            f".kw_only = {_make_boolean(kw_only)}, .weakref_slot = {_make_boolean(weakref_slot)} }}"
+            f".kw_only = {_make_boolean(kw_only)}, .weakref_slot = {_make_boolean(weakref_slot)}, "
+            f".validate = {_make_boolean(validate)} }}"
         )
 
     def _default_value_zig(name: str, val: object) -> str:
@@ -122,41 +123,28 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             "in validate=False mode; only int, float, str defaults are supported"
         )
 
+    lines: list[str] = ['const core = @import("core");', ""]
     if validate:
-        params_src = "\n".join(
-            [
-                'const core = @import("core");',
-                "",
-                *generate_zig_struct(data_type, field_pairs, defaults),
-                "",
-                f"pub const {class_name}Object = core.wrapAsPythonObject({data_type});",
-                "",
-                f"pub export var {class_name}Type: core.PyTypeObject = "
-                f'core.makeTypeObject({class_name}Object, "{class_name}", {_make_opts()});',
-            ]
-        )
+        lines.extend(generate_zig_struct(data_type, field_pairs, defaults))
+        lines.append("")
+        obj_def = f"core.wrapAsPythonObject({data_type})"
+        fields_ref = "&[_]core.FieldDescriptor{}"
     else:
         field_descs = []
-        for name in field_names:
-            if name in defaults:
-                default_str = _default_value_zig(name, defaults[name])
-            else:
-                default_str = ".required"
-            field_descs.append(f'.{{ .name = "{name}", .default = {default_str} }}')
-        fields_arr = f"[_]core.FieldDescriptor{{ {', '.join(field_descs)} }}"
-        params_src = "\n".join(
-            [
-                'const core = @import("core");',
-                "",
-                f"const {data_type}Fields = {fields_arr};",
-                "",
-                f"pub const {class_name}Object = core.wrapAsPythonObjectUnvalidated({data_type}Fields.len);",
-                "",
-                f"pub export var {class_name}Type: core.PyTypeObject = "
-                f'core.makeTypeObjectUnvalidated({class_name}Object, "{class_name}", '
-                f"&{data_type}Fields, {_make_opts()});",
-            ]
-        )
+        for fname in field_names:
+            default_str = _default_value_zig(fname, defaults[fname]) if fname in defaults else ".required"
+            field_descs.append(f'.{{ .name = "{fname}", .default = {default_str} }}')
+        lines.append(f"const {data_type}Fields = [_]core.FieldDescriptor{{ {', '.join(field_descs)} }};")
+        lines.append("")
+        obj_def = f"core.wrapAsPythonObjectUnvalidated({data_type}Fields.len)"
+        fields_ref = f"&{data_type}Fields"
+    lines.extend([
+        f"pub const {class_name}Object = {obj_def};",
+        "",
+        f"pub export var {class_name}Type: core.PyTypeObject = "
+        f'core.makeTypeObject({class_name}Object, "{class_name}", {fields_ref}, {_make_opts()});',
+    ])
+    params_src = "\n".join(lines)
 
     with tempfile.TemporaryDirectory() as tmp:
         params_path = Path(tmp) / "params.zig"
