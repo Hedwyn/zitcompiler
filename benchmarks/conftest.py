@@ -68,7 +68,7 @@ def pytest_terminal_summary(
     table.add_column("dataclass (µs)", justify="right")
     for v in _VARIANTS:
         table.add_column(f"{v} (µs)".replace("[", r"\["), justify="right")
-        table.add_column("ratio", justify="right")
+        table.add_column("rel", justify="right")
 
     for category in sorted(_benchmark_results):
         impls = _benchmark_results[category]

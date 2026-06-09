@@ -1057,6 +1057,8 @@ pub fn initFnUnvalidated(
     comptime kw_only: bool,
 ) type {
     return struct {
+        var cached_defaults: [field_descs.len]?*PyObject = std.mem.zeroes([field_descs.len]?*PyObject);
+
         pub fn call(
             self_obj: ?*PyObject,
             args: ?*PyObject,
@@ -1077,7 +1079,6 @@ pub fn initFnUnvalidated(
                     null;
 
                 if (arg != null) {
-                    if (self.slots[i]) |old| Py_DecRef(old);
                     Py_IncRef(arg);
                     self.slots[i] = arg;
                 } else {
@@ -1087,19 +1088,25 @@ pub fn initFnUnvalidated(
                             return -1;
                         },
                         .int => |v| {
-                            if (self.slots[i]) |old| Py_DecRef(old);
-                            self.slots[i] = PyLong_FromLongLong(@as(c_longlong, @intCast(v)));
-                            if (self.slots[i] == null) return -1;
+                            if (cached_defaults[i] == null) {
+                                cached_defaults[i] = PyLong_FromLongLong(@as(c_longlong, @intCast(v))) orelse return -1;
+                            }
+                            Py_IncRef(cached_defaults[i]);
+                            self.slots[i] = cached_defaults[i];
                         },
                         .float => |v| {
-                            if (self.slots[i]) |old| Py_DecRef(old);
-                            self.slots[i] = PyFloat_FromDouble(v);
-                            if (self.slots[i] == null) return -1;
+                            if (cached_defaults[i] == null) {
+                                cached_defaults[i] = PyFloat_FromDouble(v) orelse return -1;
+                            }
+                            Py_IncRef(cached_defaults[i]);
+                            self.slots[i] = cached_defaults[i];
                         },
                         .string => |v| {
-                            if (self.slots[i]) |old| Py_DecRef(old);
-                            self.slots[i] = PyUnicode_FromStringAndSize(v.ptr, @intCast(v.len));
-                            if (self.slots[i] == null) return -1;
+                            if (cached_defaults[i] == null) {
+                                cached_defaults[i] = PyUnicode_FromStringAndSize(v.ptr, @intCast(v.len)) orelse return -1;
+                            }
+                            Py_IncRef(cached_defaults[i]);
+                            self.slots[i] = cached_defaults[i];
                         },
                     }
                 }
@@ -1242,9 +1249,14 @@ pub fn hashFnUnvalidated(comptime T: type) type {
     };
 }
 
-// These are kept for use by custom Zig code that may reference PyObject fields directly.
-extern fn Py_IncRef(obj: ?*PyObject) void;
+// Py_IncRef inlined for performance (like CPython macro). Py_DecRef calls extern for proper cleanup.
 extern fn Py_DecRef(obj: ?*PyObject) void;
+
+inline fn Py_IncRef(obj: ?*PyObject) void {
+    if (obj) |o| {
+        o.ob_refcnt += 1;
+    }
+}
 
 // ── tp_hash ───────────────────────────────────────────────────────────────────
 
