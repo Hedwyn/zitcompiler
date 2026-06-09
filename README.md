@@ -163,6 +163,73 @@ When `@zetaclass` is applied, the decorator:
 
 The `Defaults` struct approach avoids any Python-level wrapper class: defaults are resolved entirely in the compiled `tp_init` slot, so the loaded `PyTypeObject` is the final Python type with no subclassing or runtime indirection.
 
+## JSON schema → native class
+
+`zitcompiler.jsonschemas` can compile a native class directly from a JSON schema definition, without writing any Python class by hand.
+
+### Quick start
+
+```python
+import json
+from pathlib import Path
+from zitcompiler.jsonschemas import zetaify
+
+schema = json.loads(Path("person.json").read_text())
+Person = zetaify(schema)
+
+p = Person(name="Alice", age=30)
+print(p)  # Person(name='Alice', age=30)
+```
+
+`zetaify` accepts a raw JSON-decoded dict or a pre-parsed `SchemaDef`. It returns a fully compiled `@zetaclass` type.
+
+### Saving a type stub
+
+Pass `stub_path` to write a `.pyi` file alongside your schema. The stub includes the `@zetaclass` decorator so it reads as a valid, annotated class definition:
+
+```python
+Person = zetaify(schema, stub_path=Path("person.pyi"))
+```
+
+Generated `person.pyi`:
+
+```python
+from zitcompiler.zetaclasses import zetaclass
+
+@zetaclass
+class Person:
+    name: str
+    age: int
+    height: float | None
+    active: bool | None
+```
+
+### Forwarding zetaclass options
+
+Any keyword accepted by `@zetaclass` can be forwarded through `zetaify`:
+
+```python
+Person = zetaify(schema, frozen=True, kw_only=True)
+```
+
+### Lower-level API
+
+Use `parse_schema` and `generate_stub` directly if you need the intermediate representations:
+
+```python
+from zitcompiler.jsonschemas import generate_stub, parse_schema
+
+schema_def = parse_schema(raw)          # → SchemaDef
+print(generate_stub(schema_def))        # plain class body
+print(generate_stub(schema_def, with_decorator=True))  # with @zetaclass header
+```
+
+### Current limitations
+
+- Only flat (non-nested) schemas are supported. Nested `object` properties are not yet handled.
+- Optional fields (`T | None`, i.e. properties absent from `required`) are present in the written stub but **excluded from the compiled native struct**, since the Zig backend has no nullable scalar type mapping yet. Only required fields with types `string`, `integer`, or `number` become native struct fields.
+- `boolean` and `null` JSON schema types appear in stubs as `bool` / `None` but are not currently supported as zetaclass field types; including them as required fields will raise a `TypeError` at compilation time.
+
 ## Known limitations
 
 ### Incremental compilation on Linux (ELF targets)
