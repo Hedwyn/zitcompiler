@@ -15,6 +15,7 @@ from ._parser import (
     generate_stub,
     parse_schema,
 )
+from ._zetaify import zetaify
 
 __all__ = [
     "JsonSchemaBaseTypes",
@@ -23,4 +24,5 @@ __all__ = [
     "SchemaProperty",
     "generate_stub",
     "parse_schema",
+    "zetaify",
 ]

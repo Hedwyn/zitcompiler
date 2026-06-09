@@ -117,7 +117,12 @@ def parse_schema(payload: JsonLike) -> SchemaDef:
     return SchemaDef(properties=properties, kw_type=kw_type, required=required, title=title)
 
 
-def generate_stub(schema: SchemaDef, class_name: str = "Schema") -> str:
+def generate_stub(
+    schema: SchemaDef,
+    class_name: str = "Schema",
+    *,
+    with_defaults: bool = False,
+) -> str:
     name = schema.title or class_name
     lines: list[str] = [f"class {name}:"]
 
@@ -128,7 +133,8 @@ def generate_stub(schema: SchemaDef, class_name: str = "Schema") -> str:
     for prop_name, prop in schema.properties.items():
         python_type = _PYTHON_TYPE_STUB.get(prop.type, "object")
         if prop_name not in schema.required:
-            lines.append(f"    {prop_name}: {python_type} | None")
+            suffix = " = None" if with_defaults else ""
+            lines.append(f"    {prop_name}: {python_type} | None{suffix}")
         else:
             lines.append(f"    {prop_name}: {python_type}")
 

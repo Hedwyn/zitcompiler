@@ -12,6 +12,7 @@ from zitcompiler.jsonschemas import (
     SchemaProperty,
     generate_stub,
     parse_schema,
+    zetaify,
 )
 
 # ---------------------------------------------------------------------------
@@ -186,3 +187,58 @@ def test_roundtrip_parse_then_stub() -> None:
     assert "id: int" in stub
     assert "name: str" in stub
     assert "price: float | None" in stub
+
+
+# ---------------------------------------------------------------------------
+# zetaify
+# ---------------------------------------------------------------------------
+
+_PERSON_SCHEMA = {
+    "type": "object",
+    "title": "Person",
+    "properties": {
+        "name": {"type": "string"},
+        "age": {"type": "integer"},
+    },
+    "required": ["name", "age"],
+}
+
+
+def test_zetaify_returns_type() -> None:
+    cls = zetaify(_PERSON_SCHEMA)
+    assert isinstance(cls, type)
+
+
+def test_zetaify_class_name_from_title() -> None:
+    cls = zetaify(_PERSON_SCHEMA)
+    assert cls.__name__ == "Person"
+
+
+def test_zetaify_instantiation() -> None:
+    Person = zetaify(_PERSON_SCHEMA)
+    p = Person(name="Alice", age=30)
+    assert p.name == "Alice"
+    assert p.age == 30
+
+
+def test_zetaify_from_schema_def() -> None:
+    schema = parse_schema(_PERSON_SCHEMA)
+    cls = zetaify(schema)
+    assert isinstance(cls, type)
+
+
+def test_zetaify_writes_stub_file(tmp_path: pytest.TempPathFactory) -> None:
+    stub_file = tmp_path / "person.pyi"
+    zetaify(_PERSON_SCHEMA, stub_path=stub_file)
+    content = stub_file.read_text()
+    assert "class Person:" in content
+    assert "name: str" in content
+    assert "age: int" in content
+
+
+def test_zetaify_kwargs_forwarded() -> None:
+    # frozen=True should produce an immutable class
+    Person = zetaify(_PERSON_SCHEMA, frozen=True)
+    p = Person(name="Bob", age=25)
+    with pytest.raises((AttributeError, TypeError)):
+        p.name = "Alice"  # type: ignore[misc]
