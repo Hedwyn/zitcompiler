@@ -756,34 +756,18 @@ class _ValidatedFloat:
     x: float = 0.0
 
 
-@pytest.mark.xfail(
-    reason=(
-        "hashFn bitcasts f64 to u64: -0.0 (0x8000_0000_0000_0000) and 0.0 "
-        "(0x0000_0000_0000_0000) compare equal in compareFields (</>), but their "
-        "bit patterns differ → different Wyhash outputs. "
-        "Violates hash contract: a == b must imply hash(a) == hash(b)."
-    ),
-    strict=True,
-)
 def test_validated_float_neg_zero_hash_contract() -> None:
     pos = _ValidatedFloat(x=0.0)
     neg = _ValidatedFloat(x=-0.0)
-    assert pos == neg  # passes: IEEE 754 semantics via compareFields
-    assert hash(pos) == hash(neg)  # fails: different bit patterns → different hashes
+    assert pos == neg
+    assert hash(pos) == hash(neg)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Consequence of the -0.0 hash bug: an object stored under x=0.0 "
-        "cannot be retrieved with key x=-0.0, even though 0.0 == -0.0."
-    ),
-    strict=True,
-)
 def test_validated_float_neg_zero_dict_lookup_fails() -> None:
     pos = _ValidatedFloat(x=0.0)
     neg = _ValidatedFloat(x=-0.0)
     d = {pos: "sentinel"}
-    assert d[neg] == "sentinel"  # fails: KeyError — hash(neg) != hash(pos)
+    assert d[neg] == "sentinel"
 
 
 @zetaclass(validate=False, frozen=True)
@@ -798,15 +782,6 @@ class _DataclassTwoFields:
     label: str = ""
 
 
-@pytest.mark.xfail(
-    reason=(
-        "hashFnUnvalidated calls PyObject_Hash(slot) per field then feeds "
-        "the results through Wyhash — double the hash work vs dataclass's "
-        "single hash+combine pass (hash(tuple(fields))). "
-        "Fails if zetaclass (validate=False) hash takes >1.5× longer than dataclass."
-    ),
-    strict=False,  # timing is environment-dependent
-)
 def test_unvalidated_hash_not_slower_than_dataclass() -> None:
     N = 300_000
     zc_objs = [_UnvalidatedTwoFields(i, str(i)) for i in range(N)]

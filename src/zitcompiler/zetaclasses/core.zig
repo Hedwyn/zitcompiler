@@ -1106,20 +1106,23 @@ pub fn richCompareFnUnvalidated(comptime T: type, comptime order: bool) type {
     };
 }
 
-/// tp_hash for the unvalidated path: feeds PyObject_Hash of each slot into Wyhash.
+/// tp_hash for the unvalidated path: combines PyObject_Hash of each slot via
+/// hash_combine (Boost-style). Each slot's Python hash is already high quality
+/// (and PYTHONHASHSEED-aware for strings), so no second hash pass is needed.
 pub fn hashFnUnvalidated(comptime T: type) type {
     const N = getSlotCount(T);
     return struct {
         pub fn call(self_obj: ?*PyObject) callconv(.c) Py_ssize_t {
             const self: *const T = @ptrCast(@alignCast(self_obj.?));
-            var hasher = std.hash.Wyhash.init(0);
+            var acc: usize = N;
             inline for (0..N) |i| {
                 const h = PyObject_Hash(self.slots[i]);
                 if (h == -1) return -1;
-                std.hash.autoHash(&hasher, @as(usize, @bitCast(h)));
+                const hh: usize = @bitCast(h);
+                // Boost hash_combine: cheap mixing without a full hash pass.
+                acc ^= hh +% 0x9e3779b97f4a7c15 +% (acc << 6) +% (acc >> 2);
             }
-            const raw: usize = @truncate(hasher.final());
-            const result: Py_ssize_t = @bitCast(raw);
+            const result: Py_ssize_t = @bitCast(acc);
             return if (result == -1) -2 else result;
         }
     };
@@ -1144,7 +1147,12 @@ pub fn hashFn(comptime T: type) type {
             inline for (@typeInfo(DataType).@"struct".fields) |field| {
                 switch (field.type) {
                     i64 => std.hash.autoHash(&hasher, @field(self.data, field.name)),
-                    f64 => std.hash.autoHash(&hasher, @as(u64, @bitCast(@field(self.data, field.name)))),
+                    f64 => {
+                        const v = @field(self.data, field.name);
+                        // Normalize -0.0 → 0.0: they compare equal so must hash equally.
+                        const bits: u64 = @bitCast(if (v == 0.0) @as(f64, 0.0) else v);
+                        std.hash.autoHash(&hasher, bits);
+                    },
                     [:0]const u8 => hasher.update(@field(self.data, field.name)),
                     else => @compileError("unsupported field type: " ++ @typeName(field.type)),
                 }
