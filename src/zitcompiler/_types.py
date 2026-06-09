@@ -152,10 +152,10 @@ def get_zig_type(
     """
     if (user_defined_type := get_annotation(type_hint, ZigType)) is not None:
         return user_defined_type.value
-    if not isinstance(type_hint, type):
-        raise UnsupportedType("Non-builtin type annotation with no annotated zig type")
     if custom_type_map and (override := custom_type_map.get(type_hint)) is not None:
         return override
+    if not isinstance(type_hint, type):
+        raise UnsupportedType("Non-builtin type annotation with no annotated zig type")
     if (builtin_type := ZIG_TYPE_MAP.get(type_hint)) is None:
         raise UnsupportedType(str(type_hint))
     return builtin_type
@@ -177,9 +177,9 @@ def generate_zig_struct(
     lines = [f"pub const {struct_name} = struct {{"]
     for fname, ftype in _field_pairs:
         zig_type = get_zig_type(ftype, custom_type_map)
-        base = _base_type(ftype)
         if fname in _defaults:
             val = _defaults[fname]
+            base = _base_type(ftype)
             if base is int:
                 assert isinstance(val, int)
                 zig_val = str(val)

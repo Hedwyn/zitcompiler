@@ -207,7 +207,39 @@ pub fn wrapAsPythonObject(comptime DataType: type, comptime validate: bool, comp
     comptime std.debug.assert(@offsetOf(T, "ob_base") == 0);
     return T;
 }
+/// Wrapper type for a nested zetaclass field (reference semantics + type check).
+///
+/// Usage in a generated DataType struct:
+///   inner: core.NestedZetaclass(_innerGetTypePtr),
+///
+/// The generated params.zig must also export a setter and a function:
+///   var _inner_type_ptr: ?*core.PyTypeObject = null;
+///   pub export fn zetaclass_set_inner_type_ptr(ptr: *anyopaque) callconv(.c) void { ... }
+///   fn _innerGetTypePtr() *core.PyTypeObject { return _inner_type_ptr.?; }
+///
+/// Python calls the setter once after the SO is loaded to inject the inner type pointer.
+/// Stores a borrowed ?*PyObject; py_cache[i] owns the reference (same pattern as ?*PyObject).
+pub fn NestedZetaclass(comptime typePtrFn: anytype) type {
+    return struct {
+        ptr: ?*PyObject,
+        pub fn getTypePtr() *PyTypeObject {
+            return typePtrFn();
+        }
+    };
+}
+
 // ── Internal comptime helpers ─────────────────────────────────────────────────
+
+/// Returns true when T is a NestedZetaclass wrapper.
+/// Detected structurally: a struct with exactly one field named "ptr" of type ?*PyObject.
+fn isNested(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| return s.fields.len == 1 and
+            std.mem.eql(u8, s.fields[0].name, "ptr") and
+            s.fields[0].type == ?*PyObject,
+        else => return false,
+    }
+}
 
 fn assertObBase(comptime T: type) void {
     const flds = @typeInfo(T).@"struct".fields;
@@ -263,7 +295,11 @@ fn checkFieldType(comptime FieldType: type, arg: ?*PyObject) bool {
         f64 => PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(&PyFloat_Type))) > 0 or
             PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(&PyLong_Type))) > 0,
         [:0]const u8 => PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(&PyUnicode_Type))) > 0,
-        else => @compileError("unsupported field type: " ++ @typeName(FieldType)),
+        ?*PyObject => true,
+        else => if (comptime isNested(FieldType))
+            PyObject_IsInstance(arg, @as(?*PyObject, @ptrCast(FieldType.getTypePtr()))) > 0
+        else
+            @compileError("unsupported field type: " ++ @typeName(FieldType)),
     };
 }
 
@@ -272,7 +308,11 @@ fn fieldTypeError(comptime FieldType: type) [*:0]const u8 {
         i64 => "expected int",
         f64 => "expected float or int",
         [:0]const u8 => "expected str",
-        else => @compileError("unsupported field type: " ++ @typeName(FieldType)),
+        ?*PyObject => "expected object",
+        else => if (comptime isNested(FieldType))
+            "expected zetaclass instance"
+        else
+            @compileError("unsupported field type: " ++ @typeName(FieldType)),
     };
 }
 
@@ -296,7 +336,14 @@ fn storeField(comptime FieldType: type, dest: *FieldType, arg: ?*PyObject) void 
             const n: usize = @intCast(size);
             dest.* = if (n == 0) "" else ptr[0..n :0];
         },
-        else => @compileError("unsupported zetaclass field type: " ++ @typeName(FieldType)),
+        ?*PyObject => dest.* = arg,
+        else => {
+            if (comptime isNested(FieldType)) {
+                dest.*.ptr = arg;
+            } else {
+                @compileError("unsupported zetaclass field type: " ++ @typeName(FieldType));
+            }
+        },
     }
 }
 
@@ -312,7 +359,14 @@ fn buildCachedValue(comptime FieldType: type, native_ptr: *const FieldType, arg:
             Py_IncRef(arg);
             break :blk arg;
         },
-        else => @compileError("unsupported field type: " ++ @typeName(FieldType)),
+        ?*PyObject => blk: {
+            Py_IncRef(arg);
+            break :blk arg;
+        },
+        else => if (comptime isNested(FieldType)) blk: {
+            Py_IncRef(arg);
+            break :blk arg;
+        } else @compileError("unsupported field type: " ++ @typeName(FieldType)),
     };
 }
 
@@ -330,6 +384,14 @@ pub fn packFn(comptime T: type, comptime frozen: bool) type {
     _ = frozen; // future: expose struct memory via buffer protocol for zero-copy on frozen
     comptime assertObBase(T);
     const DataType = getDataType(T);
+    comptime {
+        for (@typeInfo(DataType).@"struct".fields) |field| {
+            const not_serializable = field.type == ?*PyObject or
+                isNested(field.type);
+            if (not_serializable)
+                @compileError("pack: cannot serialize Python-object or nested zetaclass field '" ++ field.name ++ "'; set pack=False");
+        }
+    }
     const has_ptr = comptime hasPointerOrSlice(DataType);
     return struct {
         pub fn call(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
@@ -386,6 +448,14 @@ pub fn packFn(comptime T: type, comptime frozen: bool) type {
 pub fn unpackFn(comptime T: type) type {
     comptime assertObBase(T);
     const DataType = getDataType(T);
+    comptime {
+        for (@typeInfo(DataType).@"struct".fields) |field| {
+            const not_serializable = field.type == ?*PyObject or
+                isNested(field.type);
+            if (not_serializable)
+                @compileError("unpack: cannot deserialize Python-object or nested zetaclass field '" ++ field.name ++ "'; set pack=False");
+        }
+    }
     const has_ptr = comptime hasPointerOrSlice(DataType);
     return struct {
         pub fn call(cls_obj: ?*PyObject, bytes_obj: ?*PyObject) callconv(.c) ?*PyObject {
@@ -503,7 +573,16 @@ pub fn getsetArray(comptime T: type, comptime frozen: bool) type {
                             const s = @field(self.data, field.name);
                             break :blk PyUnicode_FromStringAndSize(s.ptr, @intCast(s.len));
                         },
-                        else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                        ?*PyObject => blk: {
+                            const ptr = @field(self.data, field.name);
+                            if (ptr) |p| Py_IncRef(p);
+                            break :blk ptr;
+                        },
+                        else => if (comptime isNested(field.type)) blk: {
+                            const ptr = @field(self.data, field.name).ptr;
+                            if (ptr) |p| Py_IncRef(p);
+                            break :blk ptr;
+                        } else @compileError("unsupported field type: " ++ @typeName(field.type)),
                     };
                     if (py_val == null) return null;
                     cache.* = py_val; // cache holds one reference
@@ -711,7 +790,7 @@ pub fn noInitFn() type {
 /// Lexicographic ordering result over fields: .lt, .eq, or .gt.
 const FieldOrder = enum { lt, eq, gt };
 
-fn compareFields(comptime T: type, a: *const T, b: *const T) FieldOrder {
+fn compareFields(comptime T: type, comptime order: bool, a: *const T, b: *const T) ?FieldOrder {
     const DataType = getDataType(T);
     inline for (@typeInfo(DataType).@"struct".fields) |field| {
         switch (field.type) {
@@ -729,7 +808,32 @@ fn compareFields(comptime T: type, a: *const T, b: *const T) FieldOrder {
                     .eq => {},
                 }
             },
-            else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+            ?*PyObject => {
+                const av = @field(a.data, field.name);
+                const bv = @field(b.data, field.name);
+                const eq = PyObject_RichCompareBool(av, bv, Py_EQ);
+                if (eq < 0) return null;
+                if (eq == 0) {
+                    if (comptime !order) return .gt;
+                    const lt = PyObject_RichCompareBool(av, bv, Py_LT);
+                    if (lt < 0) return null;
+                    return if (lt > 0) .lt else .gt;
+                }
+            },
+            else => {
+                if (comptime isNested(field.type)) {
+                    const av = @field(a.data, field.name).ptr;
+                    const bv = @field(b.data, field.name).ptr;
+                    const eq = PyObject_RichCompareBool(av, bv, Py_EQ);
+                    if (eq < 0) return null;
+                    if (eq == 0) {
+                        if (comptime !order) return .gt;
+                        const lt = PyObject_RichCompareBool(av, bv, Py_LT);
+                        if (lt < 0) return null;
+                        return if (lt > 0) .lt else .gt;
+                    }
+                } else @compileError("unsupported field type: " ++ @typeName(field.type));
+            },
         }
     }
     return .eq;
@@ -763,7 +867,7 @@ pub fn richCompareFn(comptime T: type, comptime order: bool) type {
             }
             const a: *const T = @ptrCast(@alignCast(a_obj));
             const b: *const T = @ptrCast(@alignCast(b_obj));
-            const ord = compareFields(T, a, b);
+            const ord = compareFields(T, order, a, b) orelse return null;
             const result = switch (op) {
                 Py_EQ => ord == .eq,
                 Py_NE => ord != .eq,
@@ -819,21 +923,31 @@ pub fn reprFn(comptime T: type, comptime class_name: [:0]const u8) type {
                 if (i > 0) appendConcat(&result, PyUnicode_FromStringAndSize(", ", 2));
                 appendConcat(&result, PyUnicode_FromStringAndSize(field.name.ptr, @intCast(field.name.len)));
                 appendConcat(&result, PyUnicode_FromStringAndSize("=", 1));
-                const val_repr: ?*PyObject = blk: {
-                    const val_obj: ?*PyObject = switch (field.type) {
-                        i64 => PyLong_FromLongLong(@as(c_longlong, @intCast(@field(self.data, field.name)))),
-                        f64 => PyFloat_FromDouble(@field(self.data, field.name)),
-                        [:0]const u8 => PyUnicode_FromStringAndSize(
-                            @field(self.data, field.name).ptr,
-                            @intCast(@field(self.data, field.name).len),
-                        ),
-                        else => @compileError("unsupported field type: " ++ @typeName(field.type)),
-                    };
-                    if (val_obj) |vo| {
-                        defer Py_DecRef(vo);
-                        break :blk PyObject_Repr(vo);
-                    }
-                    break :blk null;
+                const val_repr: ?*PyObject = switch (field.type) {
+                    ?*PyObject => blk: {
+                        const ptr = @field(self.data, field.name);
+                        break :blk if (ptr != null) PyObject_Repr(ptr) else PyUnicode_FromStringAndSize("None", 4);
+                    },
+                    else => blk: {
+                        if (comptime isNested(field.type)) {
+                            const ptr = @field(self.data, field.name).ptr;
+                            break :blk if (ptr != null) PyObject_Repr(ptr) else PyUnicode_FromStringAndSize("None", 4);
+                        }
+                        const val_obj: ?*PyObject = switch (field.type) {
+                            i64 => PyLong_FromLongLong(@as(c_longlong, @intCast(@field(self.data, field.name)))),
+                            f64 => PyFloat_FromDouble(@field(self.data, field.name)),
+                            [:0]const u8 => PyUnicode_FromStringAndSize(
+                                @field(self.data, field.name).ptr,
+                                @intCast(@field(self.data, field.name).len),
+                            ),
+                            else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                        };
+                        if (val_obj) |vo| {
+                            defer Py_DecRef(vo);
+                            break :blk PyObject_Repr(vo);
+                        }
+                        break :blk null;
+                    },
                 };
                 if (val_repr == null) {
                     if (result) |r| Py_DecRef(r);
@@ -1154,7 +1268,20 @@ pub fn hashFn(comptime T: type) type {
                         std.hash.autoHash(&hasher, bits);
                     },
                     [:0]const u8 => hasher.update(@field(self.data, field.name)),
-                    else => @compileError("unsupported field type: " ++ @typeName(field.type)),
+                    ?*PyObject => {
+                        const h = PyObject_Hash(@field(self.data, field.name));
+                        if (h == -1) return -1;
+                        const hu: usize = @bitCast(h);
+                        hasher.update(std.mem.asBytes(&hu));
+                    },
+                    else => {
+                        if (comptime isNested(field.type)) {
+                            const h = PyObject_Hash(@field(self.data, field.name).ptr);
+                            if (h == -1) return -1;
+                            const hu: usize = @bitCast(h);
+                            hasher.update(std.mem.asBytes(&hu));
+                        } else @compileError("unsupported field type: " ++ @typeName(field.type));
+                    },
                 }
             }
             const raw: usize = @truncate(hasher.final());

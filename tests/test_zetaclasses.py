@@ -808,6 +808,184 @@ def test_unvalidated_hash_not_slower_than_dataclass() -> None:
     )
 
 
+# ── validate=True with Python-object fields ──────────────────────────────────
+
+
+@zetaclass(validate=True)
+class _WithPyObj:
+    count: int = 0
+    value: object
+
+
+@zetaclass(frozen=True, validate=True)
+class _FrozenWithPyObj:
+    tag: str = ""
+    value: object
+
+
+def test_py_object_field_stores_and_retrieves() -> None:
+    lst = [1, 2, 3]
+    obj = _WithPyObj(count=5, value=lst)
+    assert obj.value is lst
+    assert obj.count == 5
+
+
+def test_py_object_field_accepts_any_python_type() -> None:
+    for val in ([1, 2], {"k": "v"}, (1,), "hello", 42, 3.14, None, object()):
+        obj = _WithPyObj(value=val)
+        assert obj.value == val
+
+
+def test_py_object_field_cache_same_object_on_repeated_access() -> None:
+    lst = [1, 2, 3]
+    obj = _WithPyObj(value=lst)
+    assert obj.value is obj.value
+
+
+def test_py_object_field_setter_updates_value_and_cache() -> None:
+    lst1 = [1, 2, 3]
+    lst2 = [4, 5, 6]
+    obj = _WithPyObj(value=lst1)
+    _ = obj.value  # populate cache
+    obj.value = lst2
+    assert obj.value is lst2
+    assert obj.value is obj.value  # cache is consistent after set
+
+
+def test_py_object_field_eq_uses_python_equality() -> None:
+    a = _WithPyObj(count=0, value=[1, 2, 3])
+    b = _WithPyObj(count=0, value=[1, 2, 3])
+    assert a == b
+    assert a != _WithPyObj(count=0, value=[9])
+    assert a != _WithPyObj(count=1, value=[1, 2, 3])
+
+
+def test_py_object_field_repr_shows_value() -> None:
+    obj = _WithPyObj(count=3, value=[1, 2])
+    r = repr(obj)
+    assert "value" in r
+    assert "[1, 2]" in r
+    assert "count" in r
+
+
+def test_py_object_field_packed_true_raises_at_decoration() -> None:
+    with pytest.raises(TypeError, match="packed"):
+
+        @zetaclass(validate=True, packed=True)
+        class _Bad:
+            value: object
+
+
+def test_py_object_field_default_raises_at_decoration() -> None:
+    with pytest.raises(TypeError):
+
+        @zetaclass(validate=True)
+        class _BadDefault:
+            value: object = object()
+
+
+def test_py_object_field_frozen_hashable_with_hashable_value() -> None:
+    a = _FrozenWithPyObj(tag="x", value=(1, 2, 3))
+    b = _FrozenWithPyObj(tag="x", value=(1, 2, 3))
+    assert a == b
+    assert hash(a) == hash(b)
+
+
+def test_py_object_field_frozen_unhashable_value_raises() -> None:
+    obj = _FrozenWithPyObj(tag="x", value=[1, 2])
+    with pytest.raises(TypeError):
+        hash(obj)
+
+
+# ── nested zetaclass fields ───────────────────────────────────────────────────
+
+
+@zetaclass(validate=True)
+class _Inner:
+    x: int = 0
+    label: str = ""
+
+
+@zetaclass(validate=True)
+class _Outer:
+    inner: _Inner
+    count: int = 0
+
+
+@zetaclass(frozen=True, validate=True)
+class _FrozenOuter:
+    inner: _Inner
+    tag: str = ""
+
+
+def test_nested_basic_store_and_retrieve() -> None:
+    inner = _Inner(x=42, label="hello")
+    outer = _Outer(inner=inner, count=7)
+    assert outer.count == 7
+    retrieved = outer.inner
+    assert retrieved.x == 42
+    assert retrieved.label == "hello"
+
+
+def test_nested_wrong_type_raises() -> None:
+    with pytest.raises(TypeError):
+        _Outer(inner=42, count=1)  # type: ignore[arg-type]
+
+
+def test_nested_same_object_returned() -> None:
+    inner = _Inner(x=1, label="a")
+    outer = _Outer(inner=inner, count=0)
+    assert outer.inner is inner
+
+
+def test_nested_eq() -> None:
+    inner1 = _Inner(x=10, label="foo")
+    inner2 = _Inner(x=10, label="foo")
+    outer1 = _Outer(inner=inner1, count=0)
+    outer2 = _Outer(inner=inner2, count=0)
+    assert outer1 == outer2
+    outer3 = _Outer(inner=_Inner(x=99), count=0)
+    assert outer1 != outer3
+
+
+def test_nested_repr() -> None:
+    inner = _Inner(x=5, label="hi")
+    outer = _Outer(inner=inner, count=3)
+    r = repr(outer)
+    assert "_Inner" in r or "x=5" in r
+    assert "count=3" in r
+
+
+def test_nested_mutation() -> None:
+    inner = _Inner(x=1)
+    outer = _Outer(inner=inner, count=0)
+    inner2 = _Inner(x=99, label="new")
+    outer.inner = inner2
+    assert outer.inner is inner2
+    assert outer.inner.x == 99
+
+
+def test_nested_frozen_immutable() -> None:
+    inner = _Inner(x=1)
+    obj = _FrozenOuter(inner=inner, tag="t")
+    with pytest.raises(AttributeError):
+        obj.inner = _Inner(x=2)  # type: ignore[misc]
+
+
+def test_nested_refcount_safety() -> None:
+    inner = _Inner(x=7, label="alive")
+    outer = _Outer(inner=inner, count=0)
+    del inner
+    assert outer.inner.x == 7
+
+
+def test_nested_is_zetaclass_check() -> None:
+    inner = _Inner(x=1)
+    outer = _Outer(inner=inner, count=0)
+    assert isinstance(outer, _Outer)
+    assert isinstance(outer.inner, _Inner)
+
+
 _SEED_PROBE_SCRIPT = """\
 from zitcompiler.zetaclasses import zetaclass
 

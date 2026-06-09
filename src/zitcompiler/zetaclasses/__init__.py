@@ -9,6 +9,7 @@ Populates the dataclass-like methods with native code.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import dataclasses
 import os
 import tempfile
@@ -85,11 +86,6 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     field_names = list(hints.keys())
     field_pairs = [(n, hints[n]) for n in field_names]
 
-    if validate:
-        for _, ftype in field_pairs:
-            if ftype not in ZIG_TYPE_MAP:
-                raise TypeError(f"zetaclass: unsupported field type {ftype!r}")
-
     # Collect defaults by walking MRO (closest definition wins)
     defaults: dict[str, object] = {}
     for name in field_names:
@@ -97,6 +93,58 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             if name in vars(base) and not isinstance(vars(base)[name], type):
                 defaults[name] = vars(base)[name]
                 break
+
+    custom_type_map: dict[type, str] | None = None
+    nested_fields: list[tuple[str, type]] = []
+    if validate:
+        non_native = [(n, t) for n, t in field_pairs if t not in ZIG_TYPE_MAP]
+        if non_native:
+            if packed:
+                bad = ", ".join(
+                    f"{n!r}: {t.__name__ if isinstance(t, type) else str(t)}" for n, t in non_native
+                )
+                raise TypeError(
+                    f"zetaclass: packed=True requires all fields to be native types "
+                    f"(int, float, str); non-native fields: {bad}"
+                )
+            for fname, ftype in non_native:
+                if fname in defaults:
+                    raise TypeError(
+                        f"zetaclass: field {fname!r} has non-native type "
+                        f"{ftype!r}; Zig-level defaults are not supported for "
+                        "Python-object fields"
+                    )
+            custom_type_map = {}
+            for fname, ftype in non_native:
+                if isinstance(ftype, type) and getattr(ftype, "__zetaclass__", False):
+                    if not getattr(ftype, "__zetaclass_validate__", False):
+                        raise TypeError(
+                            f"zetaclass: nested field {fname!r} must use validate=True on the inner class"
+                        )
+                    nested_fields.append((fname, ftype))
+                else:
+                    custom_type_map[ftype] = "?*core.PyObject"
+            if not custom_type_map:
+                custom_type_map = None
+
+    # Build Zig setter stubs and custom_type_map entries for nested zetaclass fields.
+    nested_setter_lines: list[str] = []
+    for fname, ftype in nested_fields:
+        get_fn = f"_zetaclass_{fname}_get_type_ptr"
+        setter_fn = f"zetaclass_set_{fname}_type_ptr"
+        nested_setter_lines.extend(
+            [
+                f"var _zetaclass_{fname}_type_ptr: ?*core.PyTypeObject = null;",
+                f"pub export fn {setter_fn}(ptr: *anyopaque) callconv(.c) void {{",
+                f"    _zetaclass_{fname}_type_ptr = @alignCast(@ptrCast(ptr));",
+                f"}}",
+                f"fn {get_fn}() *core.PyTypeObject {{ return _zetaclass_{fname}_type_ptr.?; }}",
+                "",
+            ]
+        )
+        if custom_type_map is None:
+            custom_type_map = {}
+        custom_type_map[ftype] = f"core.NestedZetaclass({get_fn})"
 
     class_name = cls.__name__
     data_type = f"{class_name}Data"
@@ -131,8 +179,10 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
         )
 
     lines: list[str] = ['const core = @import("core");', ""]
+    if nested_setter_lines:
+        lines.extend(nested_setter_lines)
     if validate:
-        lines.extend(generate_zig_struct(data_type, field_pairs, defaults))
+        lines.extend(generate_zig_struct(data_type, field_pairs, defaults, custom_type_map))
         lines.append("")
         obj_def = f"core.wrapAsPythonObject({data_type}, {_make_boolean(validate)}, {_make_boolean(packed)})"
         fields_ref = "&[_]core.FieldDescriptor{}"
@@ -180,6 +230,17 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
             extra_deps={"core": _CORE_ZIG},
         )
         so_path = asyncio.run(zig_build_lib(build_opts))
+        if nested_fields:
+            outer_lib = ctypes.CDLL(str(so_path))
+            for fname, ftype in nested_fields:
+                setter_name = f"zetaclass_set_{fname}_type_ptr"
+                setter_fn = getattr(outer_lib, setter_name)
+                setter_fn.argtypes = [ctypes.c_void_p]
+                setter_fn.restype = None
+                # id() is the memory address of a Python object in CPython.
+                # ftype.__mro__[1] is the native PyTypeObject loaded by load_class.
+                inner_native_type = ftype.__mro__[1]
+                setter_fn(ctypes.c_void_p(id(inner_native_type)))
         native_type = load_class(so_path, f"{class_name}Type")
 
     cls.__annotations__ = {n: t for n, t in field_pairs}
@@ -192,6 +253,12 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
         {
             "__dataclass_fields__": dc_fields,
             "__match_args__": match_args_tuple,
+            "__zetaclass__": True,
+            "__zetaclass_field_pairs__": field_pairs,
+            "__zetaclass_defaults__": defaults,
+            "__zetaclass_custom_type_map__": custom_type_map,
+            "__zetaclass_validate__": validate,
+            "__zetaclass_packed__": packed,
         },
     )
 
