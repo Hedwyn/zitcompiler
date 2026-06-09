@@ -9,6 +9,7 @@ dependencies = ["ziglang"]
 [project.optional-dependencies]
 cli = ["click"]
 tests = ["pytest"]
+benchmarks = ["pytest-benchmark", "rich"]
 
 [project.scripts]
 zit = "zitcompiler.cli:zit"
