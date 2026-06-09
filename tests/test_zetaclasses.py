@@ -5,6 +5,10 @@ Verifies that they match dataclasses behavior.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
 import warnings
 import weakref
 from dataclasses import MISSING, dataclass, fields
@@ -739,3 +743,130 @@ def test_validate_false_fields_compatible() -> None:
 
     zc_fields = {f.name: f for f in fields(_Unvalidated)}
     assert set(zc_fields) == {"count", "label", "score"}
+
+
+# ── Hash failures ─────────────────────────────────────────────────────────────
+# Three known bugs. See test docstrings for root-cause analysis.
+# Tests are marked xfail(strict=True) for deterministic failures and
+# xfail(strict=False) for environment-dependent timing failures.
+
+
+@zetaclass(frozen=True, validate=True)
+class _ValidatedFloat:
+    x: float = 0.0
+
+
+@pytest.mark.xfail(
+    reason=(
+        "hashFn bitcasts f64 to u64: -0.0 (0x8000_0000_0000_0000) and 0.0 "
+        "(0x0000_0000_0000_0000) compare equal in compareFields (</>), but their "
+        "bit patterns differ → different Wyhash outputs. "
+        "Violates hash contract: a == b must imply hash(a) == hash(b)."
+    ),
+    strict=True,
+)
+def test_validated_float_neg_zero_hash_contract() -> None:
+    pos = _ValidatedFloat(x=0.0)
+    neg = _ValidatedFloat(x=-0.0)
+    assert pos == neg  # passes: IEEE 754 semantics via compareFields
+    assert hash(pos) == hash(neg)  # fails: different bit patterns → different hashes
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Consequence of the -0.0 hash bug: an object stored under x=0.0 "
+        "cannot be retrieved with key x=-0.0, even though 0.0 == -0.0."
+    ),
+    strict=True,
+)
+def test_validated_float_neg_zero_dict_lookup_fails() -> None:
+    pos = _ValidatedFloat(x=0.0)
+    neg = _ValidatedFloat(x=-0.0)
+    d = {pos: "sentinel"}
+    assert d[neg] == "sentinel"  # fails: KeyError — hash(neg) != hash(pos)
+
+
+@zetaclass(validate=False, frozen=True)
+class _UnvalidatedTwoFields:
+    count: int = 0
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class _DataclassTwoFields:
+    count: int = 0
+    label: str = ""
+
+
+@pytest.mark.xfail(
+    reason=(
+        "hashFnUnvalidated calls PyObject_Hash(slot) per field then feeds "
+        "the results through Wyhash — double the hash work vs dataclass's "
+        "single hash+combine pass (hash(tuple(fields))). "
+        "Fails if zetaclass (validate=False) hash takes >1.5× longer than dataclass."
+    ),
+    strict=False,  # timing is environment-dependent
+)
+def test_unvalidated_hash_not_slower_than_dataclass() -> None:
+    N = 300_000
+    zc_objs = [_UnvalidatedTwoFields(i, str(i)) for i in range(N)]
+    dc_objs = [_DataclassTwoFields(i, str(i)) for i in range(N)]
+
+    for o in zc_objs[:100]:
+        hash(o)
+    for o in dc_objs[:100]:
+        hash(o)
+
+    t0 = time.perf_counter()
+    for o in zc_objs:
+        hash(o)
+    zc_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    for o in dc_objs:
+        hash(o)
+    dc_time = time.perf_counter() - t0
+
+    assert zc_time <= dc_time * 1.5, (
+        f"zetaclass: {zc_time:.3f}s  dataclass: {dc_time:.3f}s  "
+        f"ratio: {zc_time / dc_time:.2f}× — double-hashing overhead"
+    )
+
+
+_SEED_PROBE_SCRIPT = """\
+from zitcompiler.zetaclasses import zetaclass
+
+@zetaclass(frozen=True, validate=True)
+class _S:
+    label: str = ""
+
+print(hash(_S(label="hash_seed_probe")))
+"""
+
+
+@pytest.mark.xfail(
+    reason=(
+        "hashFn feeds string field bytes into Wyhash(seed=0), ignoring PYTHONHASHSEED. "
+        "Every process produces the same hash value for a given string, regardless of "
+        "the seed — unlike Python's randomized SipHash string hashing."
+    ),
+    strict=True,
+)
+def test_validated_string_hash_varies_with_pythonhashseed() -> None:
+    results: set[str] = set()
+    for seed in ("1", "99999"):
+        r = subprocess.run(
+            [sys.executable, "-c", _SEED_PROBE_SCRIPT],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            check=True,
+        )
+        results.add(r.stdout.strip())
+
+    # Python randomises string hashes per-process; expect two distinct values.
+    # With Wyhash(seed=0) all seeds produce identical output → len == 1, test fails.
+    assert len(results) > 1, (
+        f"Hash was identical ({next(iter(results))!r}) for both seeds "
+        f"— Wyhash seed is hardcoded to 0, PYTHONHASHSEED is ignored"
+    )
