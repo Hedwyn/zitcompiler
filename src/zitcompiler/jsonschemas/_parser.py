@@ -122,13 +122,17 @@ def generate_stub(
     class_name: str = "Schema",
     *,
     with_defaults: bool = False,
+    with_decorator: bool = False,
 ) -> str:
     name = schema.title or class_name
-    lines: list[str] = [f"class {name}:"]
+    lines: list[str] = []
+    if with_decorator:
+        lines += ["from zitcompiler.zetaclasses import zetaclass", "", "@zetaclass"]
+    lines.append(f"class {name}:")
 
     if not schema.properties:
         lines.append("    ...")
-        return "\n".join(lines)
+        return "\n".join(lines) + "\n"
 
     for prop_name, prop in schema.properties.items():
         python_type = _PYTHON_TYPE_STUB.get(prop.type, "object")
@@ -138,4 +142,4 @@ def generate_stub(
         else:
             lines.append(f"    {prop_name}: {python_type}")
 
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
