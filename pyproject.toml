@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "zitcompiler"
 version = "0.1.0"
@@ -19,7 +23,7 @@ zit = "zitcompiler.cli:zit"
 include = ["src/zitcompiler/zetaclasses/*.zig"]
 
 [tool.hatch.build.targets.wheel]
-include = ["src/zitcompiler/zetaclasses/*.zig"]
+force-include = {"src/zitcompiler/zetaclasses/core.zig" = "zitcompiler/zetaclasses/core.zig"}
 
 [project.entry-points.hatch]
 zitcompiler = "zitcompiler.build_backend.hatch"
