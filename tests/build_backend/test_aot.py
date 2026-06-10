@@ -2,7 +2,7 @@
 Integration tests for the zitcompiler hatch AoT build backend.
 
 Verifies that zit_compiled() artifacts are pre-compiled into the wheel
-and that the installed package functions correctly.
+and that the exported symbols work correctly.
 
 @date: 10.06.2026
 @author: Baptiste Pestourie
@@ -23,6 +23,18 @@ def test_aot_so_bundled() -> None:
     assert so_files, (
         f"No AoT-compiled .so found in {pkg_dir}. "
         "Expected a file matching _native___<hash>.so bundled by the hatch hook."
+    )
+
+
+def test_no_zitcompiler_runtime_dep() -> None:
+    """zitcompiler must not appear in the wheel's declared runtime dependencies."""
+    import importlib.metadata
+
+    reqs = importlib.metadata.requires("greetings") or []
+    zit_deps = [r for r in reqs if r.lower().startswith("zitcompiler")]
+    assert not zit_deps, (
+        f"greetings declares zitcompiler as a runtime dependency: {zit_deps}. "
+        "It should only appear in build-system.requires."
     )
 
 
