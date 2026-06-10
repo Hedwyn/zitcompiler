@@ -8,8 +8,11 @@ dependencies = ["ziglang"]
 
 [project.optional-dependencies]
 cli = ["click"]
-tests = ["pytest"]
+tests = ["pytest", "nox"]
 benchmarks = ["pytest-benchmark", "rich"]
 
 [project.scripts]
 zit = "zitcompiler.cli:zit"
+
+[project.entry-points.hatch]
+zitcompiler = "zitcompiler.build_backend.hatch"

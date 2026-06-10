@@ -230,6 +230,30 @@ print(generate_stub(schema_def, with_decorator=True))  # with @zetaclass header
 - Optional fields (`T | None`, i.e. properties absent from `required`) are present in the written stub but **excluded from the compiled native struct**, since the Zig backend has no nullable scalar type mapping yet. Only required fields with types `string`, `integer`, or `number` become native struct fields.
 - `boolean` and `null` JSON schema types appear in stubs as `bool` / `None` but are not currently supported as zetaclass field types; including them as required fields will raise a `TypeError` at compilation time.
 
+## Tests
+
+### Unit tests
+
+```sh
+uv run pytest tests/
+```
+
+Covers Zig module compilation (`zig_build_lib`), comptime parameter injection, and `load_function` / `load_class`.
+
+### Build backend integration tests
+
+```sh
+nox -f tests/build_backend/noxfile.py
+```
+
+Tests the hatch build hook end-to-end. The session:
+
+1. Installs `hatchling` and a local editable copy of `zitcompiler` into a fresh virtual environment.
+2. Builds the `greetings` test package (`tests/build_backend/test_pkg/`) with `uv build --no-build-isolation`. During the wheel build, the hatch hook imports `greetings`, which triggers a `zit_compiled()` call, and the resulting `.so` is bundled into the wheel.
+3. Installs the built wheel and runs `pytest tests/build_backend/test_aot.py`, which verifies that the pre-compiled `.so` is present inside the installed package and that all exported symbols (function and zetaclasses) work correctly.
+
+The test package (`greetings`) contains one `zit_compiled()` Zig function (`hello_world`) and three `@zetaclass` types (`Greeter`, `Point`, `Color`). The `hello_world` function is the AoT target; zetaclasses compile at import time as usual.
+
 ## Known limitations
 
 ### Incremental compilation on Linux (ELF targets)
