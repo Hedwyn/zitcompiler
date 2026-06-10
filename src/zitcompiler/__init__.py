@@ -78,6 +78,10 @@ class _SymbolRecord:
 _COMPILED_SYMBOLS: list[_SymbolRecord] = []
 
 
+def get_all_compiled_symbols() -> list[_SymbolRecord]:
+    return _COMPILED_SYMBOLS.copy()
+
+
 @overload
 def zit_compiled(
     module_path: Path,
@@ -225,6 +229,7 @@ __all__ = [
     "generate_zig_code",
     "generate_zig_module_code",
     "generate_zig_struct",
+    "get_all_compiled_symbols",
     "get_annotation",
     "get_annotations",
     "get_zig_type",

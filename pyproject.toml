@@ -10,6 +10,7 @@ dependencies = ["ziglang"]
 cli = ["click"]
 tests = ["pytest", "nox"]
 benchmarks = ["pytest-benchmark", "rich"]
+build = ["hatchling"]
 
 [project.scripts]
 zit = "zitcompiler.cli:zit"
