@@ -17,6 +17,8 @@ from hatchling.plugin import hookimpl
 
 from zitcompiler import get_all_compiled_symbols
 
+from .config import HatchConfig, load_config
+
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)  # noqa: T201
@@ -26,8 +28,12 @@ class HatchlingBuildHook(BuildHookInterface):
     PLUGIN_NAME = "zitcompiler"
 
     @cached_property
+    def _config(self) -> HatchConfig:
+        return load_config(self.config)
+
+    @cached_property
     def is_debug(self) -> bool:
-        if not self.config.get("debug", False):
+        if not self._config["debug"]:
             return False
         log("zitcompiler: debug mode enabled")
         return True
@@ -41,7 +47,7 @@ class HatchlingBuildHook(BuildHookInterface):
         if self.target_name != "wheel":
             return
 
-        module_name: str | None = self.config.get("module")
+        module_name = self._config["module"]
         if not module_name:
             return
 
