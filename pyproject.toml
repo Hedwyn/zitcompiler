@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "zitcompiler"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A Zig zust-in-time compiler for Python"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -23,7 +23,13 @@ zit = "zitcompiler.cli:zit"
 include = ["src/zitcompiler/zetaclasses/*.zig"]
 
 [tool.hatch.build.targets.wheel]
-force-include = {"src/zitcompiler/zetaclasses/core.zig" = "zitcompiler/zetaclasses/core.zig"}
+force-include = { "src/zitcompiler/zetaclasses/core.zig" = "zitcompiler/zetaclasses/core.zig" }
 
 [project.entry-points.hatch]
 zitcompiler = "zitcompiler.build_backend.hatch"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/zitcompiler/_version.py"
