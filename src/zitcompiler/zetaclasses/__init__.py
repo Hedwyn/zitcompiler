@@ -12,8 +12,11 @@ import asyncio
 import ctypes
 import dataclasses
 import os
+import shutil
+import sys
 import tempfile
 import warnings
+import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, Unpack, get_type_hints
 
@@ -23,6 +26,7 @@ from zitcompiler import (
     generate_zig_struct,
     load_class,
     zig_build_lib,
+    zit_debug,
 )
 
 if TYPE_CHECKING:
@@ -209,39 +213,61 @@ def _zetaclass_impl(cls: type, **kwargs: Unpack[DataclassKwargs]) -> type:
     )
     params_src = "\n".join(lines)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        params_path = Path(tmp) / "params.zig"
-        params_path.write_text(params_src)
-        if (dump_path := os.environ.get("ZETACLASS_DUMP_PATH")) is not None:
-            try:
-                Path(dump_path).write_text(params_src)
-            except OSError as exc:
-                raise OSError(
-                    f"Failed to dump params source code to {dump_path}"
-                    "This happens beucase ZETACLASS_DUMP_PATH is set",
-                ) from exc
+    _frame = sys._getframe(2)
+    caller_file = Path(_frame.f_globals.get("__file__", "."))
 
-        out_path = Path(tmp) / f"{class_name}.so"
+    if sys.platform == "win32":
+        suffix = ".dll"
+    elif sys.platform == "darwin":
+        suffix = ".dylib"
+    else:
+        suffix = ".so"
 
-        build_opts = BuildLibOptions(
-            module_path=params_path,
-            link_python=True,
-            output_path=out_path,
-            extra_deps={"core": _CORE_ZIG},
-        )
-        so_path = asyncio.run(zig_build_lib(build_opts))
-        if nested_fields:
-            outer_lib = ctypes.CDLL(str(so_path))
-            for fname, ftype in nested_fields:
-                setter_name = f"zetaclass_set_{fname}_type_ptr"
-                setter_fn = getattr(outer_lib, setter_name)
-                setter_fn.argtypes = [ctypes.c_void_p]
-                setter_fn.restype = None
-                # id() is the memory address of a Python object in CPython.
-                # ftype.__mro__[1] is the native PyTypeObject loaded by load_class.
-                inner_native_type = ftype.__mro__[1]
-                setter_fn(ctypes.c_void_p(id(inner_native_type)))
-        native_type = load_class(so_path, f"{class_name}Type")
+    content_hash = format(
+        zlib.crc32(params_src.encode() + _CORE_ZIG.read_bytes()),
+        "08x",
+    )
+    cache_path = caller_file.parent / f"{class_name}__zetaclass___{content_hash}{suffix}"
+    zit_debug(f"zetaclass {class_name!r}: hash={content_hash} -> {cache_path.name}")
+
+    if not cache_path.exists():
+        zit_debug(f"zetaclass {class_name!r}: cache miss — compiling")
+        with tempfile.TemporaryDirectory() as tmp:
+            params_path = Path(tmp) / "params.zig"
+            params_path.write_text(params_src)
+            if (dump_path := os.environ.get("ZETACLASS_DUMP_PATH")) is not None:
+                try:
+                    Path(dump_path).write_text(params_src)
+                except OSError as exc:
+                    raise OSError(
+                        f"Failed to dump params source code to {dump_path}"
+                        "This happens beucase ZETACLASS_DUMP_PATH is set",
+                    ) from exc
+            out_path = Path(tmp) / f"{class_name}{suffix}"
+            build_opts = BuildLibOptions(
+                module_path=params_path,
+                link_python=True,
+                output_path=out_path,
+                extra_deps={"core": _CORE_ZIG},
+            )
+            asyncio.run(zig_build_lib(build_opts))
+            shutil.copy2(str(out_path), str(cache_path))
+        zit_debug(f"zetaclass {class_name!r}: compiled -> {cache_path.name}")
+    else:
+        zit_debug(f"zetaclass {class_name!r}: cache hit — {cache_path.name}")
+
+    if nested_fields:
+        outer_lib = ctypes.CDLL(str(cache_path))
+        for fname, ftype in nested_fields:
+            setter_name = f"zetaclass_set_{fname}_type_ptr"
+            setter_fn = getattr(outer_lib, setter_name)
+            setter_fn.argtypes = [ctypes.c_void_p]
+            setter_fn.restype = None
+            # id() is the memory address of a Python object in CPython.
+            # ftype.__mro__[1] is the native PyTypeObject loaded by load_class.
+            inner_native_type = ftype.__mro__[1]
+            setter_fn(ctypes.c_void_p(id(inner_native_type)))
+    native_type = load_class(cache_path, f"{class_name}Type")
 
     cls.__annotations__ = {n: t for n, t in field_pairs}
     dataclasses.dataclass(cls, init=False, eq=False, repr=False)

@@ -19,10 +19,10 @@ def test_aot_so_bundled() -> None:
 
     assert greetings.__file__ is not None
     pkg_dir = Path(greetings.__file__).parent
-    so_files = list(pkg_dir.glob("_native___*.so"))
+    so_files = list(pkg_dir.glob("_greetings_hello_world_????????.so"))
     assert so_files, (
         f"No AoT-compiled .so found in {pkg_dir}. "
-        "Expected a file matching _native___<hash>.so bundled by the hatch hook."
+        "Expected a file matching _greetings_hello_world_<hash>.so bundled by the hatch hook."
     )
 
 

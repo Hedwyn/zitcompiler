@@ -8,6 +8,7 @@ Public interface for zitcompiler.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import zlib
 from dataclasses import dataclass
@@ -37,6 +38,11 @@ if TYPE_CHECKING:
 type ObjType = Literal["func", "class"]
 
 
+def zit_debug(message: str) -> None:
+    if os.environ.get("ZITCOMPILER_DEBUG"):
+        print(f"[zitcompiler] {message}", file=sys.stdout)  # noqa: T201
+
+
 def _compute_symbol_hash(
     caller_module: str,
     lineno: int,
@@ -47,8 +53,7 @@ def _compute_symbol_hash(
 ) -> int:
     source_content = module_path.read_bytes()
     metadata = (
-        f"{caller_module}\x00{lineno}\x00{module_path}\x00"
-        f"{symbol_names}\x00{obj_type}\x00{module_def!r}"
+        f"{caller_module}\x00{lineno}\x00{symbol_names}\x00{obj_type}\x00{module_def!r}"
     ).encode()
     return zlib.crc32(source_content + metadata)
 
@@ -174,18 +179,53 @@ def zit_compiled(
     else:
         suffix = ".so"
 
-    hash_val = _compute_symbol_hash(
-        caller_module,
-        lineno,
-        module_path,
-        tuple(names),
-        obj_type,
-        module_def,
-    )
-    hash_str = format(hash_val, "08x")[:8]
-    output_path = caller_file.parent / f"{module_path.stem}___{hash_str}{suffix}"
+    zit_debug(f"{caller_module}:{lineno} — resolving {module_path.name!r} {tuple(names)}")
+
+    try:
+        hash_val = _compute_symbol_hash(
+            caller_module,
+            lineno,
+            module_path,
+            tuple(names),
+            obj_type,
+            module_def,
+        )
+        hash_str = format(hash_val, "08x")[:8]
+        modname = caller_module.split(".")[-1] if caller_module else "anonymous"
+        funcname = "_".join(names) if names else "anonymous"
+        output_path = caller_file.parent / f"_{modname}_{funcname}_{hash_str}{suffix}"
+        zit_debug(f"hash={hash_str} -> {output_path.name}")
+    except FileNotFoundError:
+        # .zig source not available (e.g. installed wheel) — locate pre-compiled artifact
+        zit_debug(
+            f"source {module_path!r} not found, scanning {caller_file.parent} for pre-compiled artifact"
+        )
+        modname = caller_module.split(".")[-1] if caller_module else "anonymous"
+        funcname = "_".join(names) if names else "anonymous"
+        matches = sorted(caller_file.parent.glob(f"_{modname}_{funcname}_????????{suffix}"))
+        if not matches:
+            raise RuntimeError(
+                f"zitcompiler: no pre-compiled artifact for {module_path.name!r} found in "
+                f"{caller_file.parent} and source is unavailable for JIT compilation"
+            ) from None
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"zitcompiler: ambiguous pre-compiled artifacts for {module_path.name!r}: {matches}"
+            ) from None
+        output_path = matches[0]
+        zit_debug(f"found pre-compiled artifact: {output_path.name}")
 
     if not output_path.exists():
+        stale = [
+            p
+            for p in caller_file.parent.glob(f"_{modname}_{funcname}_????????{suffix}")
+            if p != output_path
+        ]
+        if stale:
+            zit_debug(f"cache miss — stale artifact(s) found: {[p.name for p in stale]}")
+        else:
+            zit_debug(f"cache miss — no prior artifact found")
+        zit_debug(f"compiling {output_path.name}")
         opts = BuildLibOptions(
             module_path=module_path,
             link_python=True,
@@ -193,6 +233,9 @@ def zit_compiled(
             module_def=module_def,
         )
         asyncio.run(zig_build_lib(opts))
+        zit_debug(f"compilation done -> {output_path.name}")
+    else:
+        zit_debug(f"cache hit — {output_path.name}")
 
     loaded: tuple[type[object], ...] | tuple[Callable[..., object], ...]
     match obj_type:
@@ -237,4 +280,5 @@ __all__ = [
     "load_class",
     "load_function",
     "zig_build_lib",
+    "zit_debug",
 ]
