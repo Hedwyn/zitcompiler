@@ -28,9 +28,9 @@ Load it from Python with the high-level helper:
 
 ```python
 from pathlib import Path
-from zitcompiler import zit_compiled
+from zitcompiler import zitcompiled
 
-greet = zit_compiled(Path("my_ext.zig"), "greet")
+greet = zitcompiled(Path("my_ext.zig"), "greet")
 greet()  # Hello from Zig!
 ```
 
@@ -41,14 +41,14 @@ greet()  # Hello from Zig!
 ```python
 from dataclasses import dataclass
 from pathlib import Path
-from zitcompiler import ZigModuleDef, zit_compiled
+from zitcompiler import ZigModuleDef, zitcompiled
 
 @dataclass
 class Params:
     multiplier: int = 7
 
 module_def = ZigModuleDef(top_level=Params, structs=[], module_name="params")
-get_multiplier = zit_compiled(Path("my_ext.zig"), "get_multiplier", module_def=module_def)
+get_multiplier = zitcompiled(Path("my_ext.zig"), "get_multiplier", module_def=module_def)
 ```
 
 ```zig
@@ -249,10 +249,10 @@ nox -f tests/build_backend/noxfile.py
 Tests the hatch build hook end-to-end. The session:
 
 1. Installs `hatchling` and a local editable copy of `zitcompiler` into a fresh virtual environment.
-2. Builds the `greetings` test package (`tests/build_backend/test_pkg/`) with `uv build --no-build-isolation`. During the wheel build, the hatch hook imports `greetings`, which triggers a `zit_compiled()` call, and the resulting `.so` is bundled into the wheel.
+2. Builds the `greetings` test package (`tests/build_backend/test_pkg/`) with `uv build --no-build-isolation`. During the wheel build, the hatch hook imports `greetings`, which triggers a `zitcompiled()` call, and the resulting `.so` is bundled into the wheel.
 3. Installs the built wheel and runs `pytest tests/build_backend/test_aot.py`, which verifies that the pre-compiled `.so` is present inside the installed package and that all exported symbols (function and zetaclasses) work correctly.
 
-The test package (`greetings`) contains one `zit_compiled()` Zig function (`hello_world`) and three `@zetaclass` types (`Greeter`, `Point`, `Color`). The `hello_world` function is the AoT target; zetaclasses compile at import time as usual.
+The test package (`greetings`) contains one `zitcompiled()` Zig function (`hello_world`) and three `@zetaclass` types (`Greeter`, `Point`, `Color`). The `hello_world` function is the AoT target; zetaclasses compile at import time as usual.
 
 ## Known limitations
 

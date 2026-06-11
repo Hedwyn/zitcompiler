@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from zitcompiler import zit_compiled
+from zitcompiler import zitcompiled
 from zitcompiler.zetaclasses import zetaclass
 
 _HERE = Path(__file__).parent
 
-hello_world = zit_compiled(_HERE / "_native.zig", "hello_world", "func")
+hello_world = zitcompiled(_HERE / "_native.zig", "hello_world", "func")
 
 
 @zetaclass

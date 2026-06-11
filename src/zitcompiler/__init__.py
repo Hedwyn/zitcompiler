@@ -88,7 +88,7 @@ def get_all_compiled_symbols() -> list[_SymbolRecord]:
 
 
 @overload
-def zit_compiled(
+def zitcompiled(
     module_path: Path,
     symbol_name: str,
     obj_type: Literal["func"],
@@ -98,7 +98,7 @@ def zit_compiled(
 
 
 @overload
-def zit_compiled(
+def zitcompiled(
     module_path: Path,
     symbol_name: str,
     *,
@@ -107,7 +107,7 @@ def zit_compiled(
 
 
 @overload
-def zit_compiled(
+def zitcompiled(
     module_path: Path,
     symbol_name: str,
     obj_type: Literal["class"],
@@ -117,7 +117,7 @@ def zit_compiled(
 
 
 @overload
-def zit_compiled(
+def zitcompiled(
     module_path: Path,
     symbol_name: list[str],
     obj_type: Literal["func"],
@@ -127,7 +127,7 @@ def zit_compiled(
 
 
 @overload
-def zit_compiled(
+def zitcompiled(
     module_path: Path,
     symbol_name: list[str],
     *,
@@ -136,7 +136,7 @@ def zit_compiled(
 
 
 @overload
-def zit_compiled(
+def zitcompiled(
     module_path: Path,
     symbol_name: list[str],
     obj_type: Literal["class"],
@@ -145,7 +145,7 @@ def zit_compiled(
 ) -> tuple[type, ...]: ...
 
 
-def zit_compiled(
+def zitcompiled(
     module_path: Path,
     symbol_name: str | list[str],
     obj_type: ObjType = "func",

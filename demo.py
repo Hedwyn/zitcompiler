@@ -5,11 +5,11 @@ Tiny demo for this project.
 from dataclasses import dataclass
 from pathlib import Path
 
-from zitcompiler import ZigModuleDef, zit_compiled
+from zitcompiler import ZigModuleDef, zitcompiled
 
 examples_folder = Path("examples")
 
-say_hello = zit_compiled(examples_folder / "hello_world_ext_no_mod.zig", "hello_world")
+say_hello = zitcompiled(examples_folder / "hello_world_ext_no_mod.zig", "hello_world")
 say_hello()
 
 
@@ -33,7 +33,7 @@ person_module = ZigModuleDef(
 )
 
 print("\n=== Person Module Demo ===", flush=True)
-print_person_fields, format_person_values = zit_compiled(
+print_person_fields, format_person_values = zitcompiled(
     examples_folder / "person_printer.zig",
     ["print_person_fields", "format_person_values"],
     module_def=person_module,

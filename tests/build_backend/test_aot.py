@@ -1,7 +1,7 @@
 """
 Integration tests for the zitcompiler hatch AoT build backend.
 
-Verifies that zit_compiled() artifacts are pre-compiled into the wheel
+Verifies that zitcompiled() artifacts are pre-compiled into the wheel
 and that the exported symbols work correctly.
 
 @date: 10.06.2026
